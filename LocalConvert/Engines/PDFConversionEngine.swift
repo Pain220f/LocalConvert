@@ -35,74 +35,80 @@ struct PDFConversionEngine: ConversionEngineProtocol {
 
     private func compilePDF(_ request: ConversionRequest, progress: ProgressHandler) throws -> ConversionOutput {
         let start = ContinuousClock.now
+        let strip = request.options.stripMetadata
         let baseName = request.sourceURLs.count > 1 ? "\(request.baseName) and \(request.sourceURLs.count - 1) more" : request.baseName
         let outputURL = FileStorageService.uniqueURL(in: request.outputDirectory, baseName: baseName, pathExtension: "pdf")
+        // Metadata-stripped JPEG copies live here until the PDF is closed (Quartz reads them lazily).
+        let scratch = request.outputDirectory.appending(path: ".scratch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
         guard let consumer = CGDataConsumer(url: outputURL as CFURL),
               let context = CGContext(consumer: consumer, mediaBox: nil, [kCGPDFContextCreator: "LocalConvert"] as CFDictionary)
         else { throw ConversionError.writeFailed("could not create a PDF context") }
 
         var passthrough = 0
         var decoded = 0
-        for (index, url) in request.sourceURLs.enumerated() {
-            try Task.checkCancellation()
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
-                context.closePDF()
-                throw ConversionError.unreadableSource(url)
-            }
-            let properties = ImageConversionEngine.frameProperties(source, at: 0)
-            let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)
-                .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) } ?? .up
-            let isJPEG = (CGImageSourceGetType(source) as String?) == UTType.jpeg.identifier
-            let isMirrored = [.upMirrored, .downMirrored, .leftMirrored, .rightMirrored].contains(orientation)
+        do {
+            for (index, url) in request.sourceURLs.enumerated() {
+                try Task.checkCancellation()
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
+                    throw ConversionError.unreadableSource(url)
+                }
+                let properties = ImageConversionEngine.frameProperties(source, at: 0)
+                let orientation = CGImagePropertyOrientation(rawValue: UInt32(ImageConversionEngine.orientation(of: properties))) ?? .up
+                let isJPEG = (CGImageSourceGetType(source) as String?) == UTType.jpeg.identifier
+                let isMirrored = [.upMirrored, .downMirrored, .leftMirrored, .rightMirrored].contains(orientation)
 
-            var image: CGImage?
-            var transformOrientation = orientation
-            if isJPEG, !isMirrored, let provider = CGDataProvider(url: url as CFURL) {
-                // Quartz embeds JPEG-provider images as the original DCT stream (no re-compression).
-                image = CGImage(jpegDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
-                if image != nil { passthrough += 1 }
-            }
-            if image == nil, isMirrored {
-                // Rare mirrored orientations: let ImageIO apply the transform losslessly at full size.
-                let maxSide = max(
-                    (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0,
-                    (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
-                )
-                image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: maxSide,
-                ] as CFDictionary)
-                transformOrientation = .up
-                if image != nil { decoded += 1 }
-            }
-            if image == nil {
-                image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-                if image != nil { decoded += 1 }
-            }
-            guard let image else {
-                context.closePDF()
-                throw ConversionError.unreadableSource(url)
-            }
+                var image: CGImage?
+                var transformOrientation = orientation
+                if isJPEG, !isMirrored {
+                    // Quartz embeds JPEG-provider images as the original DCT stream (no re-compression).
+                    // The JPEG file's own APP segments (EXIF/GPS/XMP) travel with that stream, so when
+                    // stripping we first remove them without touching the compressed image data.
+                    var jpegURL = url
+                    if strip {
+                        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+                        jpegURL = scratch.appending(path: "\(index).jpg")
+                        try ImageConversionEngine.writeMetadataStrippedCopy(of: url, to: jpegURL)
+                    }
+                    if let provider = CGDataProvider(url: jpegURL as CFURL) {
+                        image = CGImage(jpegDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                        if image != nil { passthrough += 1 }
+                    }
+                }
+                if image == nil {
+                    // Decoded pixels carry no EXIF/GPS. Mirrored orientations are applied by ImageIO (exact flip/rotate).
+                    image = isMirrored ? ImageConversionEngine.orientedImage(source, at: 0) : CGImageSourceCreateImageAtIndex(source, 0, nil)
+                    if isMirrored { transformOrientation = .up }
+                    if image != nil { decoded += 1 }
+                }
+                guard let image else { throw ConversionError.unreadableSource(url) }
 
-            let dpiX = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
-            let dpiY = (properties[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue ?? 72
-            let width = Double(image.width) * 72 / (dpiX > 0 ? dpiX : 72)
-            let height = Double(image.height) * 72 / (dpiY > 0 ? dpiY : 72)
-            let swapsAxes = transformOrientation == .left || transformOrientation == .right
-            var mediaBox = CGRect(x: 0, y: 0, width: swapsAxes ? height : width, height: swapsAxes ? width : height)
+                let dpiX = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
+                let dpiY = (properties[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue ?? 72
+                let width = Double(image.width) * 72 / (dpiX > 0 ? dpiX : 72)
+                let height = Double(image.height) * 72 / (dpiY > 0 ? dpiY : 72)
+                let swapsAxes = transformOrientation == .left || transformOrientation == .right
+                var mediaBox = CGRect(x: 0, y: 0, width: swapsAxes ? height : width, height: swapsAxes ? width : height)
 
-            context.beginPage(mediaBox: &mediaBox)
-            context.concatenate(Self.displayTransform(for: transformOrientation, width: width, height: height))
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            context.endPage()
-            progress(Double(index + 1) / Double(request.sourceURLs.count))
+                context.beginPage(mediaBox: &mediaBox)
+                context.concatenate(Self.displayTransform(for: transformOrientation, width: width, height: height))
+                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+                context.endPage()
+                progress(Double(index + 1) / Double(request.sourceURLs.count))
+            }
+            context.closePDF()
+        } catch {
+            // Always close the context (it holds the file open) and never leave a partial PDF behind.
+            context.closePDF()
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
         }
-        context.closePDF()
 
         var notes: [String] = []
         if passthrough > 0 { notes.append("\(passthrough) JPEG stream(s) embedded byte-for-byte (no re-compression).") }
         if decoded > 0 { notes.append("\(decoded) image(s) embedded with lossless Flate compression.") }
+        if strip { notes.append("Image metadata (EXIF, GPS, XMP) removed before embedding.") }
         let fidelity: Fidelity = decoded == 0 ? .bitExact : .lossless
         return try OutputBuilder.make(url: outputURL, fidelity: fidelity, notes: notes, engineName: displayName, startedAt: start)
     }
@@ -129,6 +135,8 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         let folder = FileStorageService.uniqueURL(in: request.outputDirectory, baseName: "\(request.baseName) pages", pathExtension: nil)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let digits = max(3, String(pageCount).count)
+        var finished = false
+        defer { if !finished { try? FileManager.default.removeItem(at: folder) } }
 
         for index in 0..<pageCount {
             try Task.checkCancellation()
@@ -143,6 +151,7 @@ struct PDFConversionEngine: ConversionEngineProtocol {
             guard single.write(to: url) else { throw ConversionError.writeFailed("page \(index + 1)") }
             progress(Double(index + 1) / Double(pageCount))
         }
+        finished = true
         let notes = ["\(pageCount) page(s) written; embedded images and vector content are not re-compressed."]
         return try OutputBuilder.make(url: folder, fidelity: .lossless, notes: notes, engineName: displayName, startedAt: start)
     }
@@ -171,6 +180,8 @@ struct PDFConversionEngine: ConversionEngineProtocol {
 
         var verbatim = 0, decoded = 0, skipped = 0
         var perPageIndex: [Int: Int] = [:]
+        var finished = false
+        defer { if !finished { try? FileManager.default.removeItem(at: folder) } }
         for (offset, entry) in collector.streams.enumerated() {
             try Task.checkCancellation()
             defer { progress(Double(offset + 1) / Double(collector.streams.count)) }
@@ -182,7 +193,16 @@ struct PDFConversionEngine: ConversionEngineProtocol {
             guard let data = CGPDFStreamCopyData(entry.stream, &format) as Data? else { skipped += 1; continue }
             switch format {
             case .jpegEncoded:
-                try data.write(to: folder.appending(path: base).appendingPathExtension("jpg"), options: .atomic)
+                let url = folder.appending(path: base).appendingPathExtension("jpg")
+                if request.options.stripMetadata {
+                    // Remove any EXIF/GPS/XMP segments inside the stream; DCT data stays byte-identical.
+                    let raw = request.outputDirectory.appending(path: ".raw-\(UUID().uuidString).jpg")
+                    defer { try? FileManager.default.removeItem(at: raw) }
+                    try data.write(to: raw, options: .atomic)
+                    try ImageConversionEngine.writeMetadataStrippedCopy(of: raw, to: url)
+                } else {
+                    try data.write(to: url, options: .atomic)
+                }
                 verbatim += 1
             case .JPEG2000:
                 try data.write(to: folder.appending(path: base).appendingPathExtension("jp2"), options: .atomic)
@@ -202,13 +222,12 @@ struct PDFConversionEngine: ConversionEngineProtocol {
                 skipped += 1
             }
         }
-        guard verbatim + decoded > 0 else {
-            try? FileManager.default.removeItem(at: folder)
-            throw ConversionError.nothingToExtract
-        }
+        guard verbatim + decoded > 0 else { throw ConversionError.nothingToExtract }
+        finished = true
 
         var notes: [String] = []
         if verbatim > 0 { notes.append("\(verbatim) JPEG/JPEG 2000 stream(s) written byte-for-byte.") }
+        if request.options.stripMetadata, verbatim > 0 { notes.append("Embedded JPEG metadata removed without re-compressing the image data.") }
         if decoded > 0 { notes.append("\(decoded) raw image(s) decoded and stored losslessly as PNG/TIFF (soft masks not applied).") }
         if skipped > 0 { notes.append("\(skipped) image(s) skipped (indexed, masks or unsupported encodings).") }
         return try OutputBuilder.make(
@@ -301,8 +320,12 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         }
         guard let space else { return nil }
 
-        let bytesPerRow = width * components * bpc / 8
-        guard data.count >= bytesPerRow * height, let provider = CGDataProvider(data: data as CFData) else { return nil }
+        // Width/height come from an untrusted file: use overflow-checked arithmetic and a sane cap.
+        let (bitsPerRow, o1) = width.multipliedReportingOverflow(by: components * bpc)
+        guard !o1, width <= 1 << 16, height <= 1 << 16 else { return nil }
+        let bytesPerRow = (bitsPerRow + 7) / 8
+        let (byteCount, o2) = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard !o2, data.count >= byteCount, let provider = CGDataProvider(data: data as CFData) else { return nil }
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue | (bpc == 16 ? CGBitmapInfo.byteOrder16Big.rawValue : 0))
         guard let image = CGImage(
             width: width, height: height,

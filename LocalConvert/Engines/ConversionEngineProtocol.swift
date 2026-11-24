@@ -25,6 +25,8 @@ typealias ProgressHandler = @Sendable (Double) -> Void
 enum VerificationResult: Sendable, Equatable {
     case notApplicable
     case pixelIdentical
+    /// Every frame present in the output is identical, but the output kept fewer frames than the source.
+    case identicalFrames(compared: Int, sourceFrames: Int)
     /// `maxChannelDelta` is expressed on an 8-bit (0–255) scale.
     case differs(maxChannelDelta: Double, differingPixels: Int, totalPixels: Int)
     case skipped(String)
@@ -35,6 +37,8 @@ enum VerificationResult: Sendable, Equatable {
             return "Not verified"
         case .pixelIdentical:
             return "Pixel-identical"
+        case let .identicalFrames(compared, sourceFrames):
+            return "\(compared) of \(sourceFrames) frames kept, each pixel-identical"
         case let .differs(maxDelta, differing, total):
             let share = total > 0 ? Double(differing) / Double(total) * 100 : 0
             return String(format: "Differs: %.2f%% of pixels, max Δ %.1f/255", share, maxDelta)

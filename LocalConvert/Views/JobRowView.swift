@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct JobRowView: View {
     let job: ConversionJob
@@ -10,7 +11,7 @@ struct JobRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: job.primaryURL.path))
+            Image(nsImage: FileIconCache.icon(for: job.isCombined ? .pdf : job.sourceType))
                 .resizable()
                 .frame(width: 34, height: 34)
 
@@ -91,10 +92,17 @@ struct JobRowView: View {
                 .help("\(ByteCount.exact(delta.before)) → \(ByteCount.exact(delta.after))")
             }
         case let .failed(message):
-            Label("Failed", systemImage: "xmark.octagon.fill")
-                .foregroundStyle(.red)
-                .help(message)
-                .lineLimit(1)
+            VStack(alignment: .trailing, spacing: 2) {
+                Label("Failed", systemImage: "xmark.octagon.fill")
+                    .foregroundStyle(.red)
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+            }
+            .help(message)
         case .cancelled:
             Label("Cancelled", systemImage: "stop.circle").foregroundStyle(.secondary)
         }
@@ -118,6 +126,19 @@ struct JobRowView: View {
         }
         .buttonStyle(.borderless)
         .frame(width: 70, alignment: .trailing)
+    }
+}
+
+/// Icons are looked up once per content type instead of on every row render.
+@MainActor
+enum FileIconCache {
+    private static var icons: [String: NSImage] = [:]
+
+    static func icon(for type: UTType) -> NSImage {
+        if let cached = icons[type.identifier] { return cached }
+        let icon = NSWorkspace.shared.icon(for: type)
+        icons[type.identifier] = icon
+        return icon
     }
 }
 
@@ -155,6 +176,10 @@ struct VerificationLabel: View {
             Label("Pixel-identical", systemImage: "checkmark.circle.fill")
                 .font(.caption2).foregroundStyle(.green)
                 .help("Source and output were decoded and compared at 16 bits per channel.")
+        case let .identicalFrames(compared, sourceFrames):
+            Label("\(compared)/\(sourceFrames) frames identical", systemImage: "square.stack.3d.down.right")
+                .font(.caption2).foregroundStyle(.orange)
+                .help(result.summary)
         case .differs:
             Label("Pixels differ", systemImage: "exclamationmark.circle.fill")
                 .font(.caption2).foregroundStyle(.orange)

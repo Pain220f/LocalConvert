@@ -11,7 +11,9 @@ import UniformTypeIdentifiers
 /// BundledToolEngine(
 ///     identifier: "oxipng", displayName: "oxipng", executableName: "oxipng",
 ///     sourceTypes: [.png], targets: [.png], fidelity: .lossless,
-///     arguments: { input, output, _ in ["-o", "max", "--strip", "safe", "--out", output.path, input.path] }
+///     arguments: { input, output, _, options in
+///         ["-o", "max", "--strip", options.stripMetadata ? "all" : "safe", "--out", output.path, input.path]
+///     }
 /// )
 /// ```
 ///
@@ -23,7 +25,7 @@ struct BundledToolEngine: ConversionEngineProtocol {
     let sourceTypes: [UTType]
     let targets: [SupportedFormat]
     let fidelity: Fidelity
-    let arguments: @Sendable (_ input: URL, _ output: URL, _ target: SupportedFormat) -> [String]
+    let arguments: @Sendable (_ input: URL, _ output: URL, _ target: SupportedFormat, _ options: ConversionOptions) -> [String]
 
     var executableURL: URL? { Bundle.main.url(forAuxiliaryExecutable: executableName) }
 
@@ -40,24 +42,44 @@ struct BundledToolEngine: ConversionEngineProtocol {
         }
         let outputURL = FileStorageService.uniqueURL(in: request.outputDirectory, baseName: request.baseName, pathExtension: pathExtension)
 
+        // stderr goes to a file, not a Pipe: a tool that writes more than the pipe buffer (~64 KB)
+        // while nobody reads would otherwise block forever and deadlock the conversion.
+        let logURL = FileStorageService.rootDirectory.appending(path: "tool-\(UUID().uuidString).log")
+        try FileManager.default.createDirectory(at: FileStorageService.rootDirectory, withIntermediateDirectories: true)
+        guard FileManager.default.createFile(atPath: logURL.path, contents: nil) else {
+            throw ConversionError.writeFailed("could not create a log file for \(displayName)")
+        }
+        defer { try? FileManager.default.removeItem(at: logURL) }
+        let log = try FileHandle(forWritingTo: logURL)
+
         let box = ProcessBox()
         box.process.executableURL = executableURL
-        box.process.arguments = arguments(request.sourceURL, outputURL, request.target)
+        box.process.arguments = arguments(request.sourceURL, outputURL, request.target, request.options)
+        box.process.standardInput = FileHandle.nullDevice
         box.process.standardOutput = FileHandle.nullDevice
-        let errorPipe = Pipe()
-        box.process.standardError = errorPipe
+        box.process.standardError = log
 
-        let status: Int32 = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                box.process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-                do { try box.process.run() } catch { continuation.resume(throwing: error) }
+        let status: Int32
+        do {
+            status = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    box.process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+                    do { try box.process.run() } catch { continuation.resume(throwing: error) }
+                }
+            } onCancel: {
+                box.terminate()
             }
-        } onCancel: {
-            box.process.terminate()
+            try log.close()
+            try Task.checkCancellation()
+        } catch {
+            try? log.close()
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
         }
-        try Task.checkCancellation()
         guard status == 0 else {
-            let message = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            try? FileManager.default.removeItem(at: outputURL)
+            let tail = ((try? Data(contentsOf: logURL)) ?? Data()).suffix(2_000)
+            let message = String(decoding: tail, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             throw ConversionError.engineFailure("\(displayName) exited with status \(status). \(message)")
         }
         progress(1)
@@ -68,4 +90,9 @@ struct BundledToolEngine: ConversionEngineProtocol {
 /// `Process` is not `Sendable`; it is only touched from the continuation and the cancel handler.
 private final class ProcessBox: @unchecked Sendable {
     let process = Process()
+
+    /// `terminate()` raises an Objective-C exception if the process was never launched.
+    func terminate() {
+        if process.isRunning { process.terminate() }
+    }
 }

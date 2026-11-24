@@ -64,7 +64,8 @@ struct MediaConversionEngine: ConversionEngineProtocol {
                 fidelity = .lossy
                 notes.append("Video re-encoded with the VideoToolbox \(Self.hasHardwareHEVCEncoder ? "hardware" : "software") HEVC encoder at highest quality. This is lossy.")
             case .alac, .wav:
-                notes += try await transcodeAudioLosslessly(asset, target: request.target, to: outputURL, progress: progress)
+                notes += try await transcodeAudioLosslessly(
+                    asset, source: request.sourceURL, target: request.target, to: outputURL, strip: strip, progress: progress)
                 fidelity = .lossless
             default:
                 throw ConversionError.unsupportedConversion(from: request.sourceType, to: request.target)
@@ -153,13 +154,13 @@ struct MediaConversionEngine: ConversionEngineProtocol {
     }
 
     private func transcodeAudioLosslessly(
-        _ asset: AVAsset, target: SupportedFormat, to url: URL, progress: @escaping ProgressHandler
+        _ asset: AVAsset, source: URL, target: SupportedFormat, to url: URL, strip: Bool, progress: @escaping ProgressHandler
     ) async throws -> [String] {
         guard let track = try await asset.loadTracks(withMediaType: .audio).first else { throw ConversionError.noAudioTrack }
         let formatDescriptions = try await track.load(.formatDescriptions)
         guard let description = formatDescriptions.first,
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
-        else { throw ConversionError.unreadableSource(url) }
+        else { throw ConversionError.unreadableSource(source) }
         let duration = try await asset.load(.duration).seconds
 
         var notes: [String] = []
@@ -219,7 +220,18 @@ struct MediaConversionEngine: ConversionEngineProtocol {
         guard writer.canAdd(input) else { throw ConversionError.encoderUnavailable(target.displayName) }
         writer.add(input)
 
-        guard reader.startReading() else { throw reader.error ?? ConversionError.unreadableSource(url) }
+        // AVAssetWriter starts with no metadata, so tags must be carried over explicitly.
+        if !strip {
+            let tags = try await Self.portableMetadata(from: asset)
+            if target == .alac {
+                writer.metadata = tags
+                if !tags.isEmpty { notes.append("\(tags.count) metadata tag(s) carried over.") }
+            } else if !tags.isEmpty {
+                notes.append("WAV cannot hold the source's \(tags.count) metadata tag(s); choose ALAC to keep them.")
+            }
+        }
+
+        guard reader.startReading() else { throw reader.error ?? ConversionError.unreadableSource(source) }
         guard writer.startWriting() else { throw writer.error ?? ConversionError.writeFailed(target.displayName) }
         writer.startSession(atSourceTime: .zero)
 
@@ -240,7 +252,7 @@ struct MediaConversionEngine: ConversionEngineProtocol {
                     progress(CMSampleBufferGetPresentationTimeStamp(buffer).seconds / duration)
                 }
             }
-            if reader.status == .failed { throw reader.error ?? ConversionError.unreadableSource(url) }
+            if reader.status == .failed { throw reader.error ?? ConversionError.unreadableSource(source) }
             input.markAsFinished()
             // An explicit end time makes the writer flush the final partial codec packet.
             if endTime > .zero { writer.endSession(atSourceTime: endTime) }
@@ -261,6 +273,25 @@ struct MediaConversionEngine: ConversionEngineProtocol {
     private struct UncheckedSendableBox<Value>: @unchecked Sendable {
         let value: Value
         init(_ value: Value) { self.value = value }
+    }
+
+    /// Re-expresses the source's tags (iTunes, QuickTime, ID3, …) through their common keys so the
+    /// writer can map them into the output container.
+    private static func portableMetadata(from asset: AVAsset) async throws -> [AVMetadataItem] {
+        var result: [AVMetadataItem] = []
+        var seen = Set<String>()
+        for item in try await asset.load(.metadata) {
+            guard let key = item.commonKey, !seen.contains(key.rawValue),
+                  let value = try await item.load(.value) else { continue }
+            let copy = AVMutableMetadataItem()
+            copy.identifier = AVMetadataItem.identifier(forKey: key.rawValue, keySpace: .common)
+            copy.value = value
+            copy.dataType = item.dataType
+            copy.extendedLanguageTag = item.extendedLanguageTag
+            result.append(copy)
+            seen.insert(key.rawValue)
+        }
+        return result
     }
 
     // MARK: - VideoToolbox

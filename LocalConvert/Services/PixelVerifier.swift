@@ -10,10 +10,45 @@ enum PixelVerifier {
     /// Upper bound to keep memory bounded (two 16-bit RGBA buffers ≈ 16 bytes/pixel).
     static let maxPixels = 60_000_000
 
+    /// Upper bound on frames compared for animated images.
+    static let maxFrames = 500
+
+    /// Compares every frame both files share, as displayed (EXIF orientation applied), so a lost
+    /// orientation flag or a changed animation frame is reported rather than masked.
     static func compare(original: URL, converted: URL) -> VerificationResult {
-        guard let a = image(at: original) else { return .skipped("could not decode the original") }
-        guard let b = image(at: converted) else { return .skipped("could not decode the output") }
-        return compare(a, b)
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let sourceA = CGImageSourceCreateWithURL(original as CFURL, options), CGImageSourceGetCount(sourceA) > 0 else {
+            return .skipped("could not decode the original")
+        }
+        guard let sourceB = CGImageSourceCreateWithURL(converted as CFURL, options), CGImageSourceGetCount(sourceB) > 0 else {
+            return .skipped("could not decode the output")
+        }
+        let framesA = CGImageSourceGetCount(sourceA)
+        let framesB = CGImageSourceGetCount(sourceB)
+        let compared = min(framesA, framesB, maxFrames)
+
+        var maxDelta = 0.0, differing = 0, total = 0
+        for index in 0..<compared {
+            guard let a = ImageConversionEngine.orientedImage(sourceA, at: index) else { return .skipped("could not decode the original") }
+            guard let b = ImageConversionEngine.orientedImage(sourceB, at: index) else { return .skipped("could not decode the output") }
+            switch compare(a, b) {
+            case .pixelIdentical:
+                total += a.width * a.height
+            case let .differs(delta, frameDiffering, frameTotal):
+                maxDelta = max(maxDelta, delta)
+                differing += frameDiffering
+                total += frameTotal
+            case let other:
+                return other
+            }
+        }
+        if differing > 0 {
+            return .differs(maxChannelDelta: maxDelta, differingPixels: differing, totalPixels: total)
+        }
+        if framesB < framesA {
+            return .identicalFrames(compared: compared, sourceFrames: framesA)
+        }
+        return .pixelIdentical
     }
 
     static func image(at url: URL, index: Int = 0) -> CGImage? {

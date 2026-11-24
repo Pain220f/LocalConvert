@@ -17,7 +17,7 @@ struct ContentView: View {
                             job: job,
                             onConvert: { queue.convert(job) },
                             onCompare: { comparisonJob = job },
-                            onSave: { queue.save(job) },
+                            onSave: { Task { await queue.save(job) } },
                             onRemove: { queue.remove(job) }
                         )
                     }
@@ -36,7 +36,7 @@ struct ContentView: View {
             SummaryBar(queue: queue)
         }
         .dropDestination(for: URL.self) { urls, _ in
-            queue.add(urls)
+            Task { await queue.add(urls) }
             return !urls.isEmpty
         } isTargeted: { isDropTargeted = $0 }
         .toolbar { toolbar }
@@ -86,7 +86,7 @@ struct ContentView: View {
                 .help("Convert every pending file (⌘↩)")
             }
 
-            Button { queue.exportAll() } label: {
+            Button { Task { await queue.exportAll() } } label: {
                 Label("Export All", systemImage: "square.and.arrow.down.on.square")
             }
             .disabled(queue.completedJobs.isEmpty)
@@ -157,6 +157,11 @@ private struct SummaryBar: View {
                 .foregroundStyle(.green)
                 .help("This app has no network entitlements. The operating system refuses any connection attempt.")
             Spacer()
+            if let activity = queue.activity {
+                ProgressView().controlSize(.small)
+                Text(activity).foregroundStyle(.secondary).lineLimit(1)
+                Divider().frame(height: 14)
+            }
             Text("\(queue.jobs.count) file(s)")
                 .foregroundStyle(.secondary)
             if let totals = queue.totals {

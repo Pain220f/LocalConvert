@@ -18,6 +18,8 @@ final class ConversionQueueManager {
     private(set) var jobs: [ConversionJob] = []
     var stripMetadata = false
     var notice: Notice?
+    /// Short description of background file work (importing a folder, exporting), for the status bar.
+    private(set) var activity: String?
 
     let registry: EngineRegistry
     let maxConcurrentJobs: Int
@@ -48,20 +50,28 @@ final class ConversionQueueManager {
 
     // MARK: - Adding & removing
 
-    func add(_ urls: [URL]) {
-        var rejected: [String] = []
-        var added = 0
-        for url in Self.expand(urls) {
-            guard !jobs.contains(where: { $0.sourceURLs == [url] }) else { continue }
-            guard let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType,
-                  let category = MediaCategory(type: type)
-            else { rejected.append(url.lastPathComponent); continue }
-            let targets = registry.targets(for: type)
-            guard !targets.isEmpty else { rejected.append(url.lastPathComponent); continue }
-            let bytes = (try? FileStorageService.byteCount(at: url)) ?? 0
-            jobs.append(ConversionJob(sourceURLs: [url], sourceType: type, category: category,
-                                      originalBytes: bytes, availableTargets: targets))
-            added += 1
+    /// A file accepted for conversion, found by the background scan.
+    struct Candidate: Sendable {
+        let url: URL
+        let type: UTType
+        let category: MediaCategory
+        let bytes: Int64
+        let targets: [SupportedFormat]
+    }
+
+    /// Scans dropped/selected items (expanding folders) off the main actor, then adds jobs.
+    func add(_ urls: [URL]) async {
+        guard !urls.isEmpty else { return }
+        activity = "Scanning \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items")…"
+        defer { activity = nil }
+        let registry = self.registry
+        let (candidates, rejected) = await Task.detached(priority: .userInitiated) {
+            Self.scan(urls, registry: registry)
+        }.value
+
+        for candidate in candidates where !jobs.contains(where: { $0.sourceURLs == [candidate.url] }) {
+            jobs.append(ConversionJob(sourceURLs: [candidate.url], sourceType: candidate.type, category: candidate.category,
+                                      originalBytes: candidate.bytes, availableTargets: candidate.targets))
         }
         if !rejected.isEmpty {
             let list = rejected.prefix(8).joined(separator: ", ") + (rejected.count > 8 ? " …" : "")
@@ -70,8 +80,24 @@ final class ConversionQueueManager {
         }
     }
 
+    nonisolated private static func scan(_ urls: [URL], registry: EngineRegistry) -> ([Candidate], [String]) {
+        var accepted: [Candidate] = []
+        var rejected: [String] = []
+        for url in expand(urls) {
+            guard let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType,
+                  let category = MediaCategory(type: type)
+            else { rejected.append(url.lastPathComponent); continue }
+            let targets = registry.targets(for: type)
+            guard !targets.isEmpty else { rejected.append(url.lastPathComponent); continue }
+            let bytes = (try? FileStorageService.byteCount(at: url)) ?? 0
+            accepted.append(Candidate(url: url, type: type, category: category, bytes: bytes, targets: targets))
+        }
+        return (accepted, rejected)
+    }
+
     func addFromOpenPanel() {
-        add(PanelService.chooseInputFiles())
+        let urls = PanelService.chooseInputFiles()
+        Task { await add(urls) }
     }
 
     /// Adds a job that compiles every image in the list into one PDF, in list order.
@@ -175,7 +201,7 @@ final class ConversionQueueManager {
 
     // MARK: - Export
 
-    func save(_ job: ConversionJob) {
+    func save(_ job: ConversionJob) async {
         guard let output = job.output,
               let destination = PanelService.saveDestination(
                 suggestedName: output.url.lastPathComponent,
@@ -183,35 +209,45 @@ final class ConversionQueueManager {
         else { return }
         let scoped = destination.startAccessingSecurityScopedResource()
         defer { if scoped { destination.stopAccessingSecurityScopedResource() } }
+        activity = "Saving \(destination.lastPathComponent)…"
+        defer { activity = nil }
+        let storage = self.storage
+        let item = output.url
         do {
-            try storage.export(output.url, to: destination)
+            // Copying a multi-GB video must not block the main thread.
+            try await Task.detached(priority: .userInitiated) { try storage.export(item, to: destination) }.value
         } catch {
             notice = Notice(title: "Export failed", message: error.localizedDescription)
         }
     }
 
-    func exportAll() {
-        let done = completedJobs
-        guard !done.isEmpty, let folder = PanelService.chooseExportFolder() else { return }
+    func exportAll() async {
+        let outputs = completedJobs.compactMap { job in job.output.map { (job.displayName, $0.url, $0.isDirectory) } }
+        guard !outputs.isEmpty, let folder = PanelService.chooseExportFolder() else { return }
         let scoped = folder.startAccessingSecurityScopedResource()
         defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
-        var failures: [String] = []
-        for job in done {
-            guard let output = job.output else { continue }
-            let name = output.url.deletingPathExtension().lastPathComponent
-            let ext = output.isDirectory ? nil : output.url.pathExtension
-            let destination = FileStorageService.uniqueURL(in: folder, baseName: name, pathExtension: ext)
-            do { try storage.export(output.url, to: destination) } catch { failures.append(job.displayName) }
-        }
+        activity = "Exporting \(outputs.count) item(s)…"
+        defer { activity = nil }
+        let storage = self.storage
+        let failures = await Task.detached(priority: .userInitiated) { () -> [String] in
+            var failures: [String] = []
+            for (name, url, isDirectory) in outputs {
+                let destination = FileStorageService.uniqueURL(
+                    in: folder, baseName: url.deletingPathExtension().lastPathComponent,
+                    pathExtension: isDirectory ? nil : url.pathExtension)
+                do { try storage.export(url, to: destination) } catch { failures.append(name) }
+            }
+            return failures
+        }.value
         notice = failures.isEmpty
-            ? Notice(title: "Export complete", message: "\(done.count) item(s) saved to “\(folder.lastPathComponent)”.")
+            ? Notice(title: "Export complete", message: "\(outputs.count) item(s) saved to “\(folder.lastPathComponent)”.")
             : Notice(title: "Some exports failed", message: failures.joined(separator: ", "))
     }
 
     // MARK: - Helpers
 
     /// Expands dropped folders into their files (recursively, hidden files skipped).
-    private static func expand(_ urls: [URL], limit: Int = 5_000) -> [URL] {
+    nonisolated private static func expand(_ urls: [URL], limit: Int = 5_000) -> [URL] {
         var result: [URL] = []
         for url in urls {
             let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]))

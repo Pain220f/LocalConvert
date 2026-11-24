@@ -28,7 +28,7 @@ struct LocalConvertApp: App {
                 Divider()
                 Button("Combine Images into PDF") { queue.combineImagesIntoPDF() }
                     .disabled(queue.imageJobs.isEmpty)
-                Button("Export All…") { queue.exportAll() }
+                Button("Export All…") { Task { await queue.exportAll() } }
                     .keyboardShortcut("e", modifiers: [.command, .shift])
                     .disabled(queue.completedJobs.isEmpty)
                 Divider()

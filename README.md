@@ -17,6 +17,7 @@ Requires macOS 15.6 or later and builds with Xcode 26 or later in Swift 6 langua
 | No network access | `com.apple.security.app-sandbox = true`. `network.client` and `network.server` are set to `false`. The kernel refuses every socket `connect`/`bind`, including to loopback. |
 | No telemetry, analytics or auto-update | No packages and no frameworks are bundled. `Network`/`CFNetwork` are not linked, and no `URLSession` or socket symbols are imported (see `Scripts/verify-privacy.sh`). |
 | Access to your files is limited | Only `com.apple.security.files.user-selected.read-write`. The app can read and write only files you drop onto it or pick in an open or save panel. |
+| Metadata stripping reaches embedded streams | With *Strip Metadata* on, EXIF, GPS and XMP are also removed from JPEGs embedded in or extracted from PDFs, without re-compressing them. Media container tags and location are dropped as well. |
 | No leftover copies | Work files live in the sandbox container's `tmp/LocalConvert/<session>/<job>/`. They are deleted when you remove a job, at quit, and at the next launch. |
 | Self-contained | Every engine is a system framework. Nothing is downloaded at runtime. |
 
@@ -50,7 +51,7 @@ Every target has a **fidelity** class, shown as a badge before you convert:
 
 Defaults always pick a **bit-exact or lossless** target. If metadata can't be stripped without re-encoding (for example, the HEIC encoder refuses), the conversion **fails rather than silently losing quality**.
 
-After every image conversion, **`PixelVerifier`** decodes the source and the output and compares them sample by sample at 16 bits per channel. The UI then shows *Pixel-identical* or the exact share of differing pixels and the maximum channel difference. Lossy results are reported, never hidden.
+After every image conversion, **`PixelVerifier`** decodes the source and the output and compares them sample by sample at 16 bits per channel. It compares **every frame** of animated images, and compares images **as displayed** (EXIF orientation applied), so a lost orientation flag counts as a difference. BMP and GIF can't store an orientation flag, so the rotation is applied to the pixels instead (an exact transform). The UI then shows *Pixel-identical* or the exact share of differing pixels and the maximum channel difference. Lossy results are reported, never hidden.
 
 Sizes are measured with `URLResourceValues.fileSize`, the exact logical byte count. Folder outputs are summed recursively. Each job and the totals show the size before, the size after, the signed delta and the percentage change.
 
@@ -85,9 +86,12 @@ LocalConvert/
 │   │   ├── JobRowView.swift             # Target picker, fidelity badge, status, before/after delta
 │   │   └── ComparisonSheetView.swift    # Side-by-side / slider / difference views + metadata diff table
 │   └── Resources/Assets.xcassets
-├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app
+├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app (37 tests)
 │   ├── ImageConversionTests.swift       # Lossless round trips, GPS stripping, PDF passthrough, byte counts
+│   ├── FidelityRegressionTests.swift    # PDF metadata stripping, orientation, animated frames, safe defaults
 │   ├── MediaConversionTests.swift       # WAV → ALAC → WAV sample-exact round trip
+│   ├── VideoConversionTests.swift       # Synthetic H.264+AAC movies: remux, M4A, HEVC, metadata keep/strip
+│   ├── QueueAndStorageTests.swift       # Bounded concurrency, cancellation, folder import, combine, atomic export
 │   └── SandboxEntitlementTests.swift    # SecTask entitlement checks + kernel socket denial
 └── Scripts/verify-privacy.sh            # Static audit of the signed Release binary
 ```
@@ -108,7 +112,7 @@ static let standard = EngineRegistry(engines: [
     BundledToolEngine(
         identifier: "oxipng", displayName: "oxipng", executableName: "oxipng",
         sourceTypes: [.png], targets: [.png], fidelity: .lossless,
-        arguments: { input, output, _ in ["-o", "max", "--out", output.path, input.path] }),
+        arguments: { input, output, _, _ in ["-o", "max", "--out", output.path, input.path] }),
     ImageConversionEngine(), PDFConversionEngine(), MediaConversionEngine(),
 ])
 ```
@@ -129,7 +133,8 @@ Signing uses **Sign to Run Locally** (ad-hoc, `CODE_SIGN_IDENTITY = "-"`). To di
 
 - HEIC/JPEG "lossless" re-encode isn't possible with system codecs. Those targets are labeled *Max-quality lossy*.
 - PDF image extraction stores raw images without their soft masks and decode arrays. Indexed and 1-bit images are skipped and counted in the job notes.
-- Pixel verification is skipped for images over 60 MP to keep memory bounded.
+- Pixel verification is skipped for images over 60 MP and capped at 500 frames, to keep memory and time bounded.
+- WAV cannot carry metadata tags, so the job notes say so when they are dropped (ALAC keeps them). ALAC output always contains the encoder's own `iTunSMPB` gapless-timing tag.
 - Video is never transcoded losslessly: remuxing is bit-exact and HEVC is lossy. Lossless video codecs can be added through the engine hook.
 
 ## License

@@ -38,7 +38,9 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         let preferred: [SupportedFormat]
         if sourceType.conforms(to: .jpeg) {
             preferred = [.jpeg, .png, .tiff, .heic, .bmp, .gif]
-        } else if sourceType.conforms(to: .heif) {
+        } else if sourceType.conforms(to: .heic) {
+            // Only true HEIC can be rewritten bit-exact. Note: on current SDKs `public.heic` does not
+            // conform to `public.heif`, and plain HEIF / AVIF fall through to a lossless PNG default.
             preferred = [.heic, .png, .tiff, .jpeg, .bmp, .gif]
         } else if sourceType.conforms(to: .gif) {
             preferred = [.gif, .png, .tiff, .heic, .jpeg, .bmp]
@@ -72,7 +74,7 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         let fidelity: Fidelity
 
         if sourceTypeID == destinationType, Self.bitstreamCopyTypes.contains(destinationType) {
-            try copyBitstream(source, to: outputURL, type: destinationType, strip: request.options.stripMetadata)
+            try Self.copyBitstream(source, to: outputURL, type: destinationType, strip: request.options.stripMetadata)
             fidelity = .bitExact
             notes.append(request.options.stripMetadata
                 ? "Metadata removed without decoding or re-compressing image data."
@@ -100,7 +102,17 @@ struct ImageConversionEngine: ConversionEngineProtocol {
 
     // MARK: - Bitstream copy
 
-    private func copyBitstream(_ source: CGImageSource, to url: URL, type: String, strip: Bool) throws {
+    /// Writes a copy of a JPEG/HEIC/PNG/TIFF file with EXIF, GPS, IPTC and XMP removed, without
+    /// decoding or re-compressing the image data. Used by other engines (PDF) that embed or extract
+    /// original image streams.
+    static func writeMetadataStrippedCopy(of url: URL, to destination: URL) throws {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let type = CGImageSourceGetType(source) as String?
+        else { throw ConversionError.unreadableSource(url) }
+        try copyBitstream(source, to: destination, type: type, strip: true)
+    }
+
+    private static func copyBitstream(_ source: CGImageSource, to url: URL, type: String, strip: Bool) throws {
         let count = CGImageSourceGetCount(source)
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, type as CFString, count, nil) else {
             throw ConversionError.encoderUnavailable(type)
@@ -160,15 +172,30 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         if [.jpeg, .bmp].contains(target), (firstFrame[kCGImagePropertyHasAlpha] as? Bool) == true {
             notes.append("\(target.displayName) has no usable alpha channel; transparency is flattened.")
         }
-        if [.bmp, .gif].contains(target),
-           let orientation = (firstFrame[kCGImagePropertyOrientation] as? NSNumber)?.intValue, orientation != 1 {
-            notes.append("\(target.displayName) cannot store an orientation flag; pixels are kept in sensor orientation.")
+        // BMP and GIF cannot store an orientation flag, so the rotation is applied to the pixels
+        // instead (an exact 90°/180° transform, no resampling).
+        let bakesOrientation = [.bmp, .gif].contains(target)
+        if bakesOrientation, Self.orientation(of: firstFrame) != 1 {
+            notes.append("\(target.displayName) cannot store an orientation flag; rotation was applied to the pixels losslessly.")
         }
 
         for index in 0..<frameCount {
             try Task.checkCancellation()
             let frame = Self.frameProperties(source, at: index)
-            if strip {
+            if bakesOrientation, Self.orientation(of: frame) != 1 {
+                guard let image = Self.orientedImage(source, at: index) else {
+                    throw ConversionError.unreadableSource(request.sourceURL)
+                }
+                var properties = strip ? Self.essentialProperties(from: frame, target: target) : frame
+                properties[kCGImagePropertyOrientation] = 1
+                properties[kCGImagePropertyPixelWidth] = nil
+                properties[kCGImagePropertyPixelHeight] = nil
+                if var tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+                    tiff[kCGImagePropertyTIFFOrientation] = 1
+                    properties[kCGImagePropertyTIFFDictionary] = tiff
+                }
+                CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+            } else if strip {
                 guard let image = CGImageSourceCreateImageAtIndex(source, index, nil) else {
                     throw ConversionError.unreadableSource(request.sourceURL)
                 }
@@ -189,6 +216,29 @@ struct ImageConversionEngine: ConversionEngineProtocol {
 
     static func frameProperties(_ source: CGImageSource, at index: Int) -> [CFString: Any] {
         (CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]) ?? [:]
+    }
+
+    static func orientation(of properties: [CFString: Any]) -> Int {
+        (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+    }
+
+    /// Frame `index` as it is meant to be displayed (EXIF orientation applied), at full resolution.
+    static func orientedImage(_ source: CGImageSource, at index: Int) -> CGImage? {
+        let properties = frameProperties(source, at: index)
+        guard orientation(of: properties) != 1 else {
+            return CGImageSourceCreateImageAtIndex(source, index, [kCGImageSourceShouldCache: false] as CFDictionary)
+        }
+        let maxSide = max(
+            (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0,
+            (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+        )
+        guard maxSide > 0 else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, index, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+            kCGImageSourceShouldCache: false,
+        ] as CFDictionary)
     }
 
     /// Non-identifying properties that affect how the image is displayed.
