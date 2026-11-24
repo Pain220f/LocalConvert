@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyLists-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hard OS-level sandbox. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Network explicitly disabled: the kernel denies every socket connect/bind. -->
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+	<!-- Only files the user drops or picks in an open/save panel are reachable. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>
