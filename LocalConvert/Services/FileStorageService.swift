@@ -1,16 +1,28 @@
+import Darwin
 import Foundation
+import os
 
 /// Owns every byte the app writes on its own: an isolated scratch directory inside the sandbox
 /// container's temporary folder, exact byte measurement and atomic export to user-chosen locations.
 struct FileStorageService: Sendable {
-    /// `<container>/tmp/LocalConvert`. Purged at launch and on quit.
+    /// `<container>/tmp/LocalConvert`. Holds one folder per session (one per queue manager).
     static let rootDirectory: URL = FileManager.default.temporaryDirectory
         .appending(path: "LocalConvert", directoryHint: .isDirectory)
+    static let lockFileName = ".session.lock"
+
+    /// Session folders created by this process, removed at quit.
+    private static let ownSessions = OSAllocatedUnfairLock<[URL]>(initialState: [])
 
     let sessionDirectory: URL
+    /// Held for the lifetime of the session so other instances never purge it.
+    private let lock: SessionLock
 
     init() {
         sessionDirectory = Self.rootDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
+        lock = SessionLock(url: sessionDirectory.appending(path: Self.lockFileName))
+        let directory = sessionDirectory
+        Self.ownSessions.withLock { $0.append(directory) }
     }
 
     /// Fresh, empty directory for one job. Previous output for the same job is discarded.
@@ -28,8 +40,28 @@ struct FileStorageService: Sendable {
         try? FileManager.default.removeItem(at: sessionDirectory.appending(path: id.uuidString, directoryHint: .isDirectory))
     }
 
-    static func purgeAll() {
-        try? FileManager.default.removeItem(at: rootDirectory)
+    /// Launch-time cleanup: removes session folders left by instances that are no longer running.
+    /// A folder whose lock is still held belongs to a live instance (another window of the app,
+    /// an Xcode test host…) and is left alone.
+    static func purgeStaleSessions() {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: nil) else { return }
+        let own = ownSessions.withLock { Set($0.map(\.standardizedFileURL)) }
+        for entry in entries where !own.contains(entry.standardizedFileURL) {
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if !isDirectory || !SessionLock.isHeld(at: entry.appending(path: lockFileName)) {
+                try? fileManager.removeItem(at: entry)
+            }
+        }
+    }
+
+    /// Quit-time cleanup: removes only this process's sessions.
+    static func removeOwnSessions() {
+        let sessions = ownSessions.withLock { sessions in
+            defer { sessions.removeAll() }
+            return sessions
+        }
+        for session in sessions { try? FileManager.default.removeItem(at: session) }
     }
 
     // MARK: - Measurement
@@ -100,5 +132,34 @@ struct FileStorageService: Sendable {
                 throw error
             }
         }
+    }
+}
+
+/// An exclusive `flock` held on a lock file for as long as this object lives.
+final class SessionLock: Sendable {
+    private let descriptor: Int32
+
+    init(url: URL) {
+        let fd = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        if fd >= 0, flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)
+            descriptor = -1
+        } else {
+            descriptor = fd
+        }
+    }
+
+    deinit {
+        if descriptor >= 0 { close(descriptor) }   // closing releases the flock
+    }
+
+    /// Whether some live process holds the lock at `url`. A missing lock file counts as not held.
+    static func isHeld(at url: URL) -> Bool {
+        let fd = open(url.path, O_RDWR | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return true }
+        flock(fd, LOCK_UN)
+        return false
     }
 }

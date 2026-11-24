@@ -1,4 +1,5 @@
 import Foundation
+import os
 import UniformTypeIdentifiers
 
 /// Extensibility hook for a future phase: wraps a statically linked, code-signed command-line tool
@@ -42,57 +43,102 @@ struct BundledToolEngine: ConversionEngineProtocol {
         }
         let outputURL = FileStorageService.uniqueURL(in: request.outputDirectory, baseName: request.baseName, pathExtension: pathExtension)
 
-        // stderr goes to a file, not a Pipe: a tool that writes more than the pipe buffer (~64 KB)
-        // while nobody reads would otherwise block forever and deadlock the conversion.
-        let logURL = FileStorageService.rootDirectory.appending(path: "tool-\(UUID().uuidString).log")
-        try FileManager.default.createDirectory(at: FileStorageService.rootDirectory, withIntermediateDirectories: true)
-        guard FileManager.default.createFile(atPath: logURL.path, contents: nil) else {
-            throw ConversionError.writeFailed("could not create a log file for \(displayName)")
-        }
-        defer { try? FileManager.default.removeItem(at: logURL) }
-        let log = try FileHandle(forWritingTo: logURL)
+        // The tool only ever sees synthetic names in a private staging folder: user file names can
+        // contain ':' or '%d' that tools like ffmpeg would treat as protocols or patterns.
+        let staging = request.outputDirectory.appending(path: ".tool-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let inputExtension = request.sourceURL.pathExtension.filter { $0.isLetter || $0.isNumber }.prefix(8)
+        let stagedInput = staging.appending(path: inputExtension.isEmpty ? "input" : "input.\(inputExtension)")
+        let stagedOutput = staging.appending(path: "output.\(pathExtension)")
+        try FileManager.default.createSymbolicLink(at: stagedInput, withDestinationURL: request.sourceURL)
+
+        // stderr is drained continuously into a bounded ring buffer: no pipe deadlock, no unbounded
+        // disk or memory use however much the tool prints.
+        let errorPipe = Pipe()
+        let stderrTail = BoundedBuffer(capacity: 16 * 1024)
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in stderrTail.append(handle.availableData) }
 
         let box = ProcessBox()
         box.process.executableURL = executableURL
-        box.process.arguments = arguments(request.sourceURL, outputURL, request.target, request.options)
+        box.process.arguments = arguments(stagedInput, stagedOutput, request.target, request.options)
+        box.process.currentDirectoryURL = staging
+        // Minimal, explicit environment: nothing (DYLD_*, proxies, tokens…) leaks in from the parent.
+        box.process.environment = ["PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "TMPDIR": staging.path]
         box.process.standardInput = FileHandle.nullDevice
         box.process.standardOutput = FileHandle.nullDevice
-        box.process.standardError = log
+        box.process.standardError = errorPipe
 
         let status: Int32
         do {
             status = try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
                     box.process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-                    do { try box.process.run() } catch { continuation.resume(throwing: error) }
+                    do { try box.launch() } catch { continuation.resume(throwing: error) }
                 }
             } onCancel: {
                 box.terminate()
             }
-            try log.close()
+            errorPipe.fileHandleForReading.readabilityHandler = nil
             try Task.checkCancellation()
         } catch {
-            try? log.close()
-            try? FileManager.default.removeItem(at: outputURL)
+            errorPipe.fileHandleForReading.readabilityHandler = nil
             throw error
         }
         guard status == 0 else {
-            try? FileManager.default.removeItem(at: outputURL)
-            let tail = ((try? Data(contentsOf: logURL)) ?? Data()).suffix(2_000)
-            let message = String(decoding: tail, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = String(decoding: stderrTail.contents.suffix(2_000), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             throw ConversionError.engineFailure("\(displayName) exited with status \(status). \(message)")
         }
+        guard FileManager.default.fileExists(atPath: stagedOutput.path) else {
+            throw ConversionError.engineFailure("\(displayName) did not produce an output file.")
+        }
+        try FileManager.default.moveItem(at: stagedOutput, to: outputURL)
         progress(1)
         return try OutputBuilder.make(url: outputURL, fidelity: fidelity, engineName: displayName, startedAt: start)
     }
 }
 
-/// `Process` is not `Sendable`; it is only touched from the continuation and the cancel handler.
+/// `Process` is not `Sendable`. All access to its run state goes through `lock`, so a cancel that
+/// races with launch either prevents the launch or terminates the running process — never neither.
 private final class ProcessBox: @unchecked Sendable {
+    private enum State { case idle, running, cancelled }
     let process = Process()
+    private let lock = OSAllocatedUnfairLock(initialState: State.idle)
 
-    /// `terminate()` raises an Objective-C exception if the process was never launched.
-    func terminate() {
-        if process.isRunning { process.terminate() }
+    func launch() throws {
+        try lock.withLock { state in
+            guard state == .idle else { throw CancellationError() }
+            try process.run()
+            state = .running
+        }
     }
+
+    func terminate() {
+        lock.withLock { state in
+            if state == .running, process.isRunning { process.terminate() }
+            state = .cancelled
+        }
+    }
+}
+
+/// Keeps only the last `capacity` bytes written to it. Thread-safe.
+final class BoundedBuffer: Sendable {
+    private let storage: OSAllocatedUnfairLock<Data>
+    private let capacity: Int
+
+    init(capacity: Int) {
+        self.capacity = capacity
+        storage = OSAllocatedUnfairLock(initialState: Data())
+    }
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        storage.withLock { data in
+            data.append(chunk.suffix(capacity))
+            if data.count > capacity { data = Data(data.suffix(capacity)) }
+        }
+    }
+
+    var contents: Data { storage.withLock { $0 } }
 }

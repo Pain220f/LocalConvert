@@ -14,14 +14,19 @@ extension MediaConversionEngine {
     func compressVideo(_ asset: AVAsset, source: URL, to url: URL, limit: Int64, strip: Bool,
                        progress: @escaping ProgressHandler) async throws -> [String] {
         let duration = try await asset.load(.duration).seconds
-        guard duration > 0, let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+        guard SafetyLimits.validDuration(duration) else {
+            throw ConversionError.inputTooLarge("the media duration (\(duration) s) is not usable for size targeting.")
+        }
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw ConversionError.unreadableSource(source)
         }
         let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
-        let sourceVideoRate = Double(try await videoTrack.load(.estimatedDataRate))
+        let declaredRate = Double(try await videoTrack.load(.estimatedDataRate))
+        let sourceVideoRate = declaredRate.isFinite ? declaredRate : 0
 
-        // 8% of the budget is reserved for container overhead.
-        let budgetBitsPerSecond = Double(limit) * 8 * 0.92 / duration
+        // 8% of the budget is reserved for container overhead. Capped at 2 Gbit/s so every later
+        // Double → Int conversion is in range whatever the limit and duration are.
+        let budgetBitsPerSecond = min(Double(limit) * 8 * 0.92 / duration, 2_000_000_000)
         let audioBitrate = audioTrack == nil ? 0 : (budgetBitsPerSecond > 1_000_000 ? 128_000 : 64_000)
         var videoBitrate = budgetBitsPerSecond - Double(audioBitrate)
         if sourceVideoRate > 0 { videoBitrate = min(videoBitrate, max(sourceVideoRate, 500_000)) }
@@ -35,8 +40,11 @@ extension MediaConversionEngine {
 
         var lastSize: Int64?
         for pass in 1...2 {
+            guard let bitrate = SafetyLimits.clampedInt(videoBitrate, to: Int(Self.minimumVideoBitrate)...2_000_000_000) else {
+                throw tooSmall(lastSize)
+            }
             try await transcodeToHEVC(asset, videoTrack: videoTrack, audioTrack: audioTrack, source: source, to: url,
-                                      videoBitrate: Int(videoBitrate), audioBitrate: audioBitrate, strip: strip,
+                                      videoBitrate: bitrate, audioBitrate: audioBitrate, strip: strip,
                                       duration: duration, progress: progress)
             let size = try FileStorageService.byteCount(at: url)
             if size <= limit {
@@ -56,7 +64,13 @@ extension MediaConversionEngine {
                                  duration: Double, progress: @escaping ProgressHandler) async throws {
         let naturalSize = try await videoTrack.load(.naturalSize)
         let transform = try await videoTrack.load(.preferredTransform)
-        let frameRate = try await videoTrack.load(.nominalFrameRate)
+        let declaredFrameRate = try await videoTrack.load(.nominalFrameRate)
+        let frameRate = declaredFrameRate.isFinite && declaredFrameRate > 0 && declaredFrameRate <= 1_000 ? declaredFrameRate : 0
+        guard let videoWidth = SafetyLimits.int(Double(naturalSize.width).rounded(), in: 1...SafetyLimits.maxVideoSide),
+              let videoHeight = SafetyLimits.int(Double(naturalSize.height).rounded(), in: 1...SafetyLimits.maxVideoSide)
+        else {
+            throw ConversionError.inputTooLarge("the video frame size (\(naturalSize.width)×\(naturalSize.height)) is outside 1…\(SafetyLimits.maxVideoSide) px.")
+        }
 
         let reader = try AVAssetReader(asset: asset)
         let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
@@ -70,8 +84,8 @@ extension MediaConversionEngine {
         if frameRate > 0 { compression[AVVideoExpectedSourceFrameRateKey] = frameRate }
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: Int(naturalSize.width.rounded()),
-            AVVideoHeightKey: Int(naturalSize.height.rounded()),
+            AVVideoWidthKey: videoWidth,
+            AVVideoHeightKey: videoHeight,
             AVVideoCompressionPropertiesKey: compression,
         ])
         videoInput.expectsMediaDataInRealTime = false
@@ -105,12 +119,15 @@ extension MediaConversionEngine {
                    progress: @escaping ProgressHandler) async throws -> [String] {
         guard let track = try await asset.loadTracks(withMediaType: .audio).first else { throw ConversionError.noAudioTrack }
         let duration = try await asset.load(.duration).seconds
-        guard duration > 0 else { throw ConversionError.unreadableSource(source) }
+        guard SafetyLimits.validDuration(duration) else {
+            throw ConversionError.inputTooLarge("the audio duration (\(duration) s) is not usable for encoding.")
+        }
         let channels = min(2, try await Self.channelCount(of: track))
         let range = channels == 1 ? 32_000...192_000 : 64_000...320_000
 
-        var bitrate = limit.map { Int(Double($0) * 8 * 0.94 / duration) } ?? (channels == 1 ? 128_000 : 256_000)
-        bitrate = min(max(bitrate, range.lowerBound), range.upperBound)
+        // Clamped before conversion: a huge limit or tiny duration can't overflow Int.
+        var bitrate = limit.flatMap { SafetyLimits.clampedInt(Double($0) * 8 * 0.94 / duration, to: range) }
+            ?? (channels == 1 ? 128_000 : 256_000)
         let tags = strip ? [] : try await Self.portableMetadata(from: asset)
 
         var lastSize: Int64 = 0
@@ -135,7 +152,7 @@ extension MediaConversionEngine {
             if lastSize <= limit { return [note] }
             try? FileManager.default.removeItem(at: url)
             guard bitrate > range.lowerBound else { break }
-            bitrate = max(range.lowerBound, Int(Double(bitrate) * Double(limit) / Double(lastSize) * 0.95))
+            bitrate = SafetyLimits.clampedInt(Double(bitrate) * Double(limit) / Double(lastSize) * 0.95, to: range) ?? range.lowerBound
         }
         throw ConversionError.cannotMeetTargetSize(
             smallestAchievable: lastSize, target: limit ?? 0,
@@ -157,7 +174,8 @@ extension MediaConversionEngine {
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
         else { throw ConversionError.noAudioTrack }
         let channels = min(2, max(1, Int(asbd.mChannelsPerFrame)))
-        let sampleRate = min(asbd.mSampleRate > 0 ? asbd.mSampleRate : 44_100, 48_000)
+        let declaredRate = asbd.mSampleRate
+        let sampleRate = declaredRate.isFinite && declaredRate >= 8_000 ? min(declaredRate, 48_000) : 44_100
         var layout = AudioChannelLayout()
         layout.mChannelLayoutTag = channels == 1 ? kAudioChannelLayoutTag_Mono : kAudioChannelLayoutTag_Stereo
         let layoutData = Data(bytes: &layout, count: MemoryLayout<AudioChannelLayout>.size)

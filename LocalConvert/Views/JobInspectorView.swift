@@ -116,7 +116,12 @@ struct JobInspectorView: View {
             HStack(spacing: 8) {
                 TextField("Size", value: Binding(
                     get: { Double(job.targetSizeBytes) / unit.bytes },
-                    set: { job.setTargetMaxBytes(Int64(($0 * unit.bytes).rounded())) }
+                    set: { value in
+                        // Typed/pasted values are clamped before converting; non-finite input is ignored.
+                        let bytes = (value * unit.bytes).rounded()
+                        guard bytes.isFinite else { return }
+                        job.setTargetMaxBytes(Int64(min(max(bytes, 0), Double(SafetyLimits.maxTargetBytes))))
+                    }
                 ), format: .number.precision(.fractionLength(0...2)))
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)

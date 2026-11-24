@@ -86,6 +86,7 @@ struct ImageConversionEngine: ConversionEngineProtocol {
             throw ConversionError.unreadableSource(request.sourceURL)
         }
 
+        try SafetyLimits.checkImage(source, at: 0, url: request.sourceURL)
         let sourceTypeID = (CGImageSourceGetType(source) as String?) ?? request.sourceType.identifier
         let outputURL = FileStorageService.uniqueURL(
             in: request.outputDirectory, baseName: request.baseName, pathExtension: pathExtension
@@ -190,7 +191,9 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         }
         if target == .gif,
            let container = CGImageSourceCopyProperties(source, nil) as? [CFString: Any],
-           let gif = container[kCGImagePropertyGIFDictionary] {
+           var gif = container[kCGImagePropertyGIFDictionary] as? [CFString: Any] {
+            // Stripping keeps only playback behaviour (loop count), not comments or app extensions.
+            if request.options.stripMetadata { gif = gif.filter { $0.key == kCGImagePropertyGIFLoopCount } }
             CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: gif] as CFDictionary)
         }
 
@@ -207,6 +210,8 @@ struct ImageConversionEngine: ConversionEngineProtocol {
 
         for index in 0..<frameCount {
             try Task.checkCancellation()
+            // Every frame is checked: a small first frame can hide a huge later one.
+            try SafetyLimits.checkImage(source, at: index, url: request.sourceURL)
             let frame = Self.frameProperties(source, at: index)
             if bakesOrientation, Self.orientation(of: frame) != 1 {
                 guard let image = Self.orientedImage(source, at: index) else {
@@ -250,6 +255,8 @@ struct ImageConversionEngine: ConversionEngineProtocol {
 
     /// Frame `index` as it is meant to be displayed (EXIF orientation applied), at full resolution.
     static func orientedImage(_ source: CGImageSource, at index: Int) -> CGImage? {
+        // Defence in depth: never decode past the safety ceiling, whoever the caller is.
+        guard SafetyLimits.isDecodable(source, at: index) else { return nil }
         let properties = frameProperties(source, at: index)
         guard orientation(of: properties) != 1 else {
             return CGImageSourceCreateImageAtIndex(source, index, [kCGImageSourceShouldCache: false] as CFDictionary)

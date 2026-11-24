@@ -10,7 +10,9 @@ cd "$(dirname "$0")/.."
 if [[ $# -ge 1 ]]; then
   APP="$1"
 else
-  DERIVED="$(mktemp -d)/dd"
+  WORK="$(mktemp -d)"
+  trap 'rm -rf "$WORK"' EXIT
+  DERIVED="$WORK/dd"
   echo "▸ Building Release into $DERIVED"
   xcodebuild -project LocalConvert.xcodeproj -scheme LocalConvert -configuration Release \
     -destination "generic/platform=macOS" -derivedDataPath "$DERIVED" build -quiet
@@ -21,6 +23,14 @@ echo "▸ Architectures: $(lipo -archs "$BIN")"
 fail=0
 pass() { print -P "%F{green}✔%f $1"; }
 bad()  { print -P "%F{red}✘%f $1"; fail=1; }
+
+if codesign --verify --deep --strict "$APP" 2>/dev/null; then pass "code signature valid (deep, strict)"; else bad "code signature invalid"; fi
+# Capture first, then parse: `grep -m1` closing the pipe early would SIGPIPE codesign under pipefail.
+SIGNING="$(codesign -dvvv "$APP" 2>&1 || true)"
+FLAGS="$(sed -nE 's/^CodeDirectory.*flags=([^ ]+).*/\1/p' <<<"$SIGNING" | head -n1)"
+[[ "$FLAGS" == *runtime* ]] && pass "Hardened Runtime enforced ($FLAGS)" || bad "Hardened Runtime flag missing ($FLAGS)"
+HEADER="$(otool -hv "$BIN")"
+if grep -q PIE <<<"$HEADER"; then pass "position-independent executable (PIE)"; else bad "binary is not PIE"; fi
 
 ENT="$(codesign -d --entitlements :- "$APP" 2>/dev/null)"
 value() { /usr/libexec/PlistBuddy -c "Print :$1" /dev/stdin <<<"$ENT" 2>/dev/null || echo "absent"; }

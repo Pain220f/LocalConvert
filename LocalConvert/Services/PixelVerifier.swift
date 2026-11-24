@@ -29,6 +29,9 @@ enum PixelVerifier {
 
         var maxDelta = 0.0, differing = 0, total = 0
         for index in 0..<compared {
+            guard SafetyLimits.isDecodable(sourceA, at: index), SafetyLimits.isDecodable(sourceB, at: index) else {
+                return .skipped("image exceeds the decoding safety limit")
+            }
             guard let a = ImageConversionEngine.orientedImage(sourceA, at: index) else { return .skipped("could not decode the original") }
             guard let b = ImageConversionEngine.orientedImage(sourceB, at: index) else { return .skipped("could not decode the output") }
             switch compare(a, b) {
@@ -53,13 +56,15 @@ enum PixelVerifier {
 
     static func image(at url: URL, index: Int = 0) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              CGImageSourceGetCount(source) > index
+              CGImageSourceGetCount(source) > index,
+              SafetyLimits.isDecodable(source, at: index)
         else { return nil }
         return CGImageSourceCreateImageAtIndex(source, index, [kCGImageSourceShouldCache: false] as CFDictionary)
     }
 
     static func compare(_ a: CGImage, _ b: CGImage) -> VerificationResult {
         let total = a.width * a.height
+        guard total > 0, b.width > 0, b.height > 0 else { return .skipped("image has no pixels") }
         guard a.width == b.width, a.height == b.height else {
             return .differs(maxChannelDelta: 255, differingPixels: total, totalPixels: total)
         }
@@ -72,7 +77,10 @@ enum PixelVerifier {
 
         // Fast path: byte-identical buffers.
         let identical = bufferA.withUnsafeBytes { pa in
-            bufferB.withUnsafeBytes { pb in memcmp(pa.baseAddress!, pb.baseAddress!, pa.count) == 0 }
+            bufferB.withUnsafeBytes { pb in
+                guard let a = pa.baseAddress, let b = pb.baseAddress, pa.count == pb.count else { return false }
+                return memcmp(a, b, pa.count) == 0
+            }
         }
         if identical { return .pixelIdentical }
 

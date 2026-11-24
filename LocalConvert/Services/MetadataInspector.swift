@@ -152,7 +152,7 @@ enum MetadataInspector {
 enum PreviewLoader {
     /// Full-resolution-ish raster preview with EXIF orientation applied.
     static func image(at url: URL, maxPixelSize: Int = 4096) async -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), SafetyLimits.isDecodable(source, at: 0) else { return nil }
         return CGImageSourceCreateThumbnailAtIndex(source, 0, [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,

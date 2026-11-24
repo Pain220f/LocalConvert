@@ -41,13 +41,14 @@ struct LocalConvertApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Remove scratch files left behind by a previous session (e.g. after a crash).
-        FileStorageService.purgeAll()
+        // Remove scratch files left behind by instances that are no longer running (e.g. a crash),
+        // without touching another live instance's work.
+        FileStorageService.purgeStaleSessions()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
-        FileStorageService.purgeAll()
+        FileStorageService.removeOwnSessions()
     }
 }

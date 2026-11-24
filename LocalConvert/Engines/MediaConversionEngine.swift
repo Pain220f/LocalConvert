@@ -52,7 +52,7 @@ struct MediaConversionEngine: ConversionEngineProtocol {
         do {
             switch request.target {
             case .mov, .mp4:
-                try await export(asset, preset: AVAssetExportPresetPassthrough,
+                try await export(strip ? try await Self.metadataFreeComposition(of: asset) : asset, preset: AVAssetExportPresetPassthrough,
                                  fileType: request.target == .mov ? .mov : .mp4,
                                  to: outputURL, strip: strip, progress: progress)
                 fidelity = .bitExact
@@ -73,7 +73,7 @@ struct MediaConversionEngine: ConversionEngineProtocol {
                                              limit: request.options.targetMaxBytes, strip: strip, progress: progress)
                 fidelity = .lossy
             case .hevcMOV:
-                try await export(asset, preset: AVAssetExportPresetHEVCHighestQuality, fileType: .mov,
+                try await export(strip ? try await Self.metadataFreeComposition(of: asset) : asset, preset: AVAssetExportPresetHEVCHighestQuality, fileType: .mov,
                                  to: outputURL, strip: strip, progress: progress)
                 fidelity = .lossy
                 notes.append("Video re-encoded with the VideoToolbox \(Self.hasHardwareHEVCEncoder ? "hardware" : "software") HEVC encoder at highest quality. This is lossy.")
@@ -88,7 +88,7 @@ struct MediaConversionEngine: ConversionEngineProtocol {
             try? FileManager.default.removeItem(at: outputURL)
             throw error
         }
-        if strip { notes.append("Container metadata (incl. location) removed.") }
+        if strip { notes.append("All container and track metadata (incl. location) and timed-metadata tracks removed.") }
         if let limit = request.options.targetMaxBytes {
             let size = try FileStorageService.byteCount(at: outputURL)
             guard size <= limit else {
@@ -187,6 +187,10 @@ struct MediaConversionEngine: ConversionEngineProtocol {
         guard let description = formatDescriptions.first,
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
         else { throw ConversionError.unreadableSource(source) }
+        // Header values are untrusted: a NaN/huge sample rate or channel count must not reach Int().
+        guard asbd.mSampleRate.isFinite, (1_000...768_000).contains(asbd.mSampleRate),
+              (1...64).contains(asbd.mChannelsPerFrame)
+        else { throw ConversionError.inputTooLarge("unsupported audio format (\(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch).") }
         let duration = try await asset.load(.duration).seconds
 
         var notes: [String] = []
@@ -299,6 +303,21 @@ struct MediaConversionEngine: ConversionEngineProtocol {
     private struct UncheckedSendableBox<Value>: @unchecked Sendable {
         let value: Value
         init(_ value: Value) { self.value = value }
+    }
+
+    /// The source's media tracks in a fresh composition: asset-level tags, track-level tags and
+    /// timed-metadata tracks (which can hold per-frame GPS) are all left behind. Samples are
+    /// referenced, not copied, so a passthrough export stays bit-exact.
+    static func metadataFreeComposition(of asset: AVAsset) async throws -> AVMutableComposition {
+        let composition = AVMutableComposition()
+        for track in try await asset.load(.tracks) where track.mediaType != .metadata {
+            let range = try await track.load(.timeRange)
+            guard let copy = composition.addMutableTrack(withMediaType: track.mediaType,
+                                                         preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+            try copy.insertTimeRange(range, of: track, at: range.start)
+            copy.preferredTransform = try await track.load(.preferredTransform)
+        }
+        return composition
     }
 
     /// Re-expresses the source's tags (iTunes, QuickTime, ID3, …) through their common keys so the

@@ -106,6 +106,8 @@ enum ConversionError: LocalizedError {
     case encryptedPDF
     case nothingToExtract
     case engineFailure(String)
+    /// The input exceeds a safety ceiling (dimensions, pages, decoded size, duration).
+    case inputTooLarge(String)
     /// The byte limit can't be met with the current settings. Nothing is written.
     case cannotMeetTargetSize(smallestAchievable: Int64, target: Int64, suggestion: String)
 
@@ -131,6 +133,8 @@ enum ConversionError: LocalizedError {
             "No extractable raster images were found in this PDF."
         case let .engineFailure(reason):
             reason
+        case let .inputTooLarge(reason):
+            "This file is outside safe limits: \(reason)"
         case let .cannotMeetTargetSize(smallest, target, suggestion):
             "Can't fit under \(ByteCount.format(target)): the smallest result is \(ByteCount.format(smallest)). \(suggestion)"
         }

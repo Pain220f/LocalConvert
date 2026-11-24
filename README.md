@@ -41,6 +41,23 @@ On top of these, the queue manager re-checks every result: an output larger than
 | No leftover copies | Work files live in the sandbox container's `tmp/LocalConvert/<session>/<job>/`. They are deleted when you remove a job, at quit, and at the next launch. |
 | Self-contained | Every engine is a system framework. Nothing is downloaded at runtime. |
 
+### Hardening against hostile files
+
+Every input is treated as untrusted. `Services/SafetyLimits.swift` holds the ceilings, and they are checked *before* anything is decoded:
+
+- **Decompression bombs:** each image frame's declared size is checked before decoding (150 MP, 65,535 px per side). Raw PDF image streams are checked against their declared size before being inflated (512 MB). Rasterized PDF pages are capped at 8,192 px per side and 64 MP, and at most 500 pages are rasterized.
+- **Hostile headers:** page boxes that are empty, non-finite or absurd, NaN or near-zero media durations, invalid sample rates and huge frame sizes fail with a clear error instead of crashing. Every `Double → Int` conversion is range-checked or clamped.
+- **Metadata stripping reaches embedded data:**
+  - JPEGs inside PDFs have their EXIF/XMP/IPTC segments neutralised in place by `PDFMetadataScrubber`. The segments keep the same length, so the PDF structure and the image data are untouched.
+  - Compressed PDFs are rebuilt without the catalog XMP.
+  - Extracted JPEG 2000 images are saved as PNG.
+  - GIFs keep only their loop count.
+  - Remuxed video drops all asset-level tags, track-level tags and timed-metadata tracks.
+  - No `Creator` is written.
+- **Signing:** Release builds are signed with the Hardened Runtime (`--options=runtime`), and `verify-privacy.sh` checks for it.
+- **Scratch files:** each running instance holds an `flock` on its own session folder. Launch cleanup only removes folders no live instance holds, and quit removes only the instance's own folders.
+- **Future CLI tools** (`BundledToolEngine`): a minimal explicit environment, synthetic file names (no `:` or `%d` injection), a 16 KB stderr ring buffer, and a lock-protected launch/cancel.
+
 ### Verifying it yourself
 
 ```bash
@@ -110,13 +127,14 @@ LocalConvert/
 │   │   ├── JobInspectorView.swift       # Mode switch, format picker, Keep-under limit, presets, result
 │   │   └── ComparisonSheetView.swift    # Side-by-side / slider / difference views + metadata diff table
 │   └── Resources/Assets.xcassets
-├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app (52 tests)
+├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app (69 tests)
 │   ├── ImageConversionTests.swift       # Lossless round trips, GPS stripping, PDF passthrough, byte counts
 │   ├── FidelityRegressionTests.swift    # PDF metadata stripping, orientation, animated frames, safe defaults
 │   ├── MediaConversionTests.swift       # WAV → ALAC → WAV sample-exact round trip
 │   ├── VideoConversionTests.swift       # Synthetic H.264+AAC movies: remux, M4A, HEVC, metadata keep/strip
 │   ├── CompressionTests.swift           # Strict size limits, monotonic quality, refusals, downscaling, job modes
 │   ├── QueueAndStorageTests.swift       # Bounded concurrency, cancellation, folder import, combine, atomic export
+│   ├── SecurityTests.swift              # Bombs, hostile PDFs, numeric traps, metadata stripping, session isolation
 │   └── SandboxEntitlementTests.swift    # SecTask entitlement checks + kernel socket denial
 └── Scripts/verify-privacy.sh            # Static audit of the signed Release binary
 ```

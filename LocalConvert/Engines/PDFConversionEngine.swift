@@ -50,7 +50,7 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         defer { try? FileManager.default.removeItem(at: scratch) }
 
         guard let consumer = CGDataConsumer(url: outputURL as CFURL),
-              let context = CGContext(consumer: consumer, mediaBox: nil, [kCGPDFContextCreator: "LocalConvert"] as CFDictionary)
+              let context = CGContext(consumer: consumer, mediaBox: nil, Self.pdfInfo(strip: strip))
         else { throw ConversionError.writeFailed("could not create a PDF context") }
 
         var passthrough = 0
@@ -61,6 +61,7 @@ struct PDFConversionEngine: ConversionEngineProtocol {
                 guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(source) > 0 else {
                     throw ConversionError.unreadableSource(url)
                 }
+                try SafetyLimits.checkImage(source, at: 0, url: url)
                 let properties = ImageConversionEngine.frameProperties(source, at: 0)
                 let orientation = CGImagePropertyOrientation(rawValue: UInt32(ImageConversionEngine.orientation(of: properties))) ?? .up
                 let isJPEG = (CGImageSourceGetType(source) as String?) == UTType.jpeg.identifier
@@ -91,10 +92,8 @@ struct PDFConversionEngine: ConversionEngineProtocol {
                 }
                 guard let image else { throw ConversionError.unreadableSource(url) }
 
-                let dpiX = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
-                let dpiY = (properties[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue ?? 72
-                let width = Double(image.width) * 72 / (dpiX > 0 ? dpiX : 72)
-                let height = Double(image.height) * 72 / (dpiY > 0 ? dpiY : 72)
+                let width = Double(image.width) * 72 / Self.sanitizedDPI(properties[kCGImagePropertyDPIWidth])
+                let height = Double(image.height) * 72 / Self.sanitizedDPI(properties[kCGImagePropertyDPIHeight])
                 let swapsAxes = transformOrientation == .left || transformOrientation == .right
                 var mediaBox = CGRect(x: 0, y: 0, width: swapsAxes ? height : width, height: swapsAxes ? width : height)
 
@@ -105,6 +104,7 @@ struct PDFConversionEngine: ConversionEngineProtocol {
                 progress(Double(index + 1) / Double(request.sourceURLs.count))
             }
             context.closePDF()
+            if strip { try Self.scrubEmbeddedJPEGs(at: outputURL) }
         } catch {
             // Always close the context (it holds the file open) and never leave a partial PDF behind.
             context.closePDF()
@@ -118,6 +118,34 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         if strip { notes.append("Image metadata (EXIF, GPS, XMP) removed before embedding.") }
         let fidelity: Fidelity = decoded == 0 ? .bitExact : .lossless
         return try OutputBuilder.make(url: outputURL, fidelity: fidelity, notes: notes, engineName: displayName, startedAt: start)
+    }
+
+    /// Rewrites a PDF file with embedded-JPEG metadata neutralised (same length, see PDFMetadataScrubber).
+    static func scrubEmbeddedJPEGs(at url: URL) throws {
+        var data = try Data(contentsOf: url)
+        if PDFMetadataScrubber.scrubEmbeddedJPEGs(in: &data) > 0 { try data.write(to: url, options: .atomic) }
+    }
+
+    /// Honest note about what stripping achieved for a PDF file or a folder of PDFs.
+    static func stripReport(for url: URL) -> String {
+        let files = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            ? ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? [])
+            : [url]
+        let remaining = files.reduce(0) { $0 + PDFMetadataScrubber.embeddedJPEGsWithMetadata(in: $1) }
+        return remaining == 0
+            ? "Document info and embedded image metadata (EXIF, GPS, XMP, IPTC) removed."
+            : "Warning: \(remaining) embedded image(s) are stored in a way LocalConvert can't rewrite and may still contain metadata."
+    }
+
+    /// Untrusted DPI tags are only honoured within 1…10,000 dpi; anything else means 72.
+    static func sanitizedDPI(_ value: Any?) -> Double {
+        guard let dpi = (value as? NSNumber)?.doubleValue, dpi.isFinite, (1...10_000).contains(dpi) else { return 72 }
+        return dpi
+    }
+
+    /// Document info for new PDFs. Nothing identifying is written when the user strips metadata.
+    static func pdfInfo(strip: Bool) -> CFDictionary? {
+        strip ? nil : [kCGPDFContextCreator: "LocalConvert"] as CFDictionary
     }
 
     /// Maps the image rect (0,0,w,h) onto the page so the image displays upright (Quartz is y-up).
@@ -156,10 +184,12 @@ struct PDFConversionEngine: ConversionEngineProtocol {
             let name = "\(request.baseName) p" + String(format: "%0\(digits)d", index + 1)
             let url = folder.appending(path: name).appendingPathExtension("pdf")
             guard single.write(to: url) else { throw ConversionError.writeFailed("page \(index + 1)") }
+            if request.options.stripMetadata { try Self.scrubEmbeddedJPEGs(at: url) }
             progress(Double(index + 1) / Double(pageCount))
         }
         finished = true
-        let notes = ["\(pageCount) page(s) written; embedded images and vector content are not re-compressed."]
+        var notes = ["\(pageCount) page(s) written; embedded images and vector content are not re-compressed."]
+        if request.options.stripMetadata { notes.append(Self.stripReport(for: folder)) }
         return try OutputBuilder.make(url: folder, fidelity: .lossless, notes: notes, engineName: displayName, startedAt: start)
     }
 
@@ -185,7 +215,7 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         let folder = FileStorageService.uniqueURL(in: request.outputDirectory, baseName: "\(request.baseName) images", pathExtension: nil)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-        var verbatim = 0, decoded = 0, skipped = 0
+        var verbatim = 0, decoded = 0, skipped = 0, jp2Converted = 0
         var perPageIndex: [Int: Int] = [:]
         var finished = false
         defer { if !finished { try? FileManager.default.removeItem(at: folder) } }
@@ -196,6 +226,11 @@ struct PDFConversionEngine: ConversionEngineProtocol {
             perPageIndex[entry.page] = imageNumber
             let base = String(format: "page-%03d-image-%02d", entry.page, imageNumber)
 
+            // Inflating a stream (FlateDecode etc.) happens inside CGPDFStreamCopyData, so the declared
+            // dimensions are validated first: a tiny stream must not expand into gigabytes.
+            guard let streamDictionary = CGPDFStreamGetDictionary(entry.stream),
+                  Self.declaredDecodedSize(streamDictionary).map({ $0 <= SafetyLimits.maxPDFStreamBytes }) == true
+            else { skipped += 1; continue }
             var format = CGPDFDataFormat.raw
             guard let data = CGPDFStreamCopyData(entry.stream, &format) as Data? else { skipped += 1; continue }
             switch format {
@@ -211,6 +246,17 @@ struct PDFConversionEngine: ConversionEngineProtocol {
                     try data.write(to: url, options: .atomic)
                 }
                 verbatim += 1
+            case .JPEG2000 where request.options.stripMetadata:
+                // JPEG 2000 can carry XMP/EXIF boxes and ImageIO can't rewrite them losslessly, so the
+                // image is decoded (already size-checked above) and stored as metadata-free PNG.
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(source) > 0,
+                      SafetyLimits.isDecodable(source, at: 0),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+                      let destination = CGImageDestinationCreateWithURL(
+                        folder.appending(path: base).appendingPathExtension("png") as CFURL, UTType.png.identifier as CFString, 1, nil)
+                else { skipped += 1; continue }
+                CGImageDestinationAddImage(destination, image, nil)
+                if CGImageDestinationFinalize(destination) { decoded += 1; jp2Converted += 1 } else { skipped += 1 }
             case .JPEG2000:
                 try data.write(to: folder.appending(path: base).appendingPathExtension("jp2"), options: .atomic)
                 verbatim += 1
@@ -235,12 +281,28 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         var notes: [String] = []
         if verbatim > 0 { notes.append("\(verbatim) JPEG/JPEG 2000 stream(s) written byte-for-byte.") }
         if request.options.stripMetadata, verbatim > 0 { notes.append("Embedded JPEG metadata removed without re-compressing the image data.") }
+        if jp2Converted > 0 { notes.append("\(jp2Converted) JPEG 2000 image(s) saved as lossless PNG so their embedded metadata could be removed.") }
         if decoded > 0 { notes.append("\(decoded) raw image(s) decoded and stored losslessly as PNG/TIFF (soft masks not applied).") }
         if skipped > 0 { notes.append("\(skipped) image(s) skipped (indexed, masks or unsupported encodings).") }
         return try OutputBuilder.make(
             url: folder, fidelity: decoded == 0 ? .bitExact : .lossless,
             notes: notes, engineName: displayName, startedAt: start
         )
+    }
+
+    /// Worst-case decoded byte size of an image XObject from its declared header (4 components),
+    /// or `nil` if the header is missing or absurd.
+    static func declaredDecodedSize(_ dictionary: CGPDFDictionaryRef) -> Int? {
+        var width: CGPDFInteger = 0, height: CGPDFInteger = 0, bpc: CGPDFInteger = 8
+        guard CGPDFDictionaryGetInteger(dictionary, "Width", &width),
+              CGPDFDictionaryGetInteger(dictionary, "Height", &height),
+              (1...SafetyLimits.maxImageSide).contains(width), (1...SafetyLimits.maxImageSide).contains(height)
+        else { return nil }
+        _ = CGPDFDictionaryGetInteger(dictionary, "BitsPerComponent", &bpc)
+        guard (1...16).contains(bpc) else { return nil }
+        let (pixels, o1) = width.multipliedReportingOverflow(by: height)
+        let (bits, o2) = pixels.multipliedReportingOverflow(by: 4 * bpc)
+        return o1 || o2 ? nil : bits / 8
     }
 
     /// Page resources, honouring inheritance from parent `Pages` nodes.

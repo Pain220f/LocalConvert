@@ -28,9 +28,12 @@ extension ImageConversionEngine {
             throw ConversionError.unsupportedConversion(from: request.sourceType, to: target)
         }
         guard let source = CGImageSourceCreateWithURL(request.sourceURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-              CGImageSourceGetCount(source) > 0,
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+              CGImageSourceGetCount(source) > 0
         else { throw ConversionError.unreadableSource(request.sourceURL) }
+        try SafetyLimits.checkImage(source, at: 0, url: request.sourceURL)
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw ConversionError.unreadableSource(request.sourceURL)
+        }
 
         let frame = Self.frameProperties(source, at: 0)
         var properties = request.options.stripMetadata ? Self.essentialProperties(from: frame, target: target) : frame

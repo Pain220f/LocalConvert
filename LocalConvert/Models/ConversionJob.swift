@@ -174,11 +174,11 @@ final class ConversionJob: Identifiable {
         reset()
     }
 
-    /// `nil` switches the limit off. Values are clamped to at least 1 KB.
+    /// `nil` switches the limit off. Values are clamped to 1 KB … 1 PB.
     func setTargetMaxBytes(_ bytes: Int64?) {
         guard !isBusy else { return }
         if let bytes {
-            let clamped = max(bytes, 1_000)
+            let clamped = min(max(bytes, 1_000), SafetyLimits.maxTargetBytes)
             guard !isTargetSizeEnabled || clamped != targetSizeBytes else { return }
             targetSizeBytes = clamped
             isTargetSizeEnabled = true
