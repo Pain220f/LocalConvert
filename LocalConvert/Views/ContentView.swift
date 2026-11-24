@@ -3,38 +3,44 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Bindable var queue: ConversionQueueManager
+    @State private var selection: ConversionJob.ID?
     @State private var comparisonJob: ConversionJob?
     @State private var isDropTargeted = false
+
+    /// The selected job, falling back to the first one so a single file shows its controls at once.
+    private var selectedJob: ConversionJob? {
+        queue.jobs.first { $0.id == selection } ?? queue.jobs.first
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             if queue.jobs.isEmpty {
-                DropZoneView(isTargeted: isDropTargeted) { queue.addFromOpenPanel() }
+                EmptyStateView(isTargeted: isDropTargeted) { queue.addFromOpenPanel() }
             } else {
-                List {
-                    ForEach(queue.jobs) { job in
-                        JobRowView(
-                            job: job,
-                            onConvert: { queue.convert(job) },
-                            onCompare: { comparisonJob = job },
-                            onSave: { Task { await queue.save(job) } },
-                            onRemove: { queue.remove(job) }
-                        )
+                HStack(spacing: 0) {
+                    FileListView(queue: queue, selectedID: selectedJob?.id, isDropTargeted: isDropTargeted) { job in
+                        selection = job.id
                     }
-                }
-                .listStyle(.inset(alternatesRowBackgrounds: true))
-                .overlay {
-                    if isDropTargeted {
-                        RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8]))
-                            .padding(6)
-                            .allowsHitTesting(false)
+                    .frame(minWidth: 360, maxWidth: .infinity)
+
+                    Divider()
+
+                    if let job = selectedJob {
+                        JobInspectorView(
+                            job: job,
+                            queue: queue,
+                            onCompare: { comparisonJob = job },
+                            onSave: { Task { await queue.save(job) } }
+                        )
+                        .id(job.id)
+                        .frame(width: 380)
                     }
                 }
             }
             Divider()
-            SummaryBar(queue: queue)
+            StatusBar(queue: queue)
         }
+        .background(Color(nsColor: .windowBackgroundColor))
         .dropDestination(for: URL.self) { urls, _ in
             Task { await queue.add(urls) }
             return !urls.isEmpty
@@ -55,121 +61,153 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
+        ToolbarItem(placement: .navigation) {
             Button { queue.addFromOpenPanel() } label: {
-                Label("Add Files", systemImage: "plus")
+                Label("Add", systemImage: "plus")
             }
+            .labelStyle(.titleAndIcon)
             .help("Add files or folders (⌘O)")
         }
-        ToolbarItemGroup(placement: .primaryAction) {
-            Toggle(isOn: $queue.stripMetadata) {
-                Label("Strip Metadata", systemImage: queue.stripMetadata ? "location.slash.fill" : "location.slash")
-            }
-            .help("Remove EXIF, GPS, IPTC and XMP metadata (images) or container metadata (media)")
-
-            Button { queue.combineImagesIntoPDF() } label: {
-                Label("Combine into PDF", systemImage: "doc.on.doc")
-            }
-            .disabled(queue.imageJobs.isEmpty)
-            .help("Compile every image in the list into one PDF without re-compressing")
-
-            if queue.isRunning {
-                Button { queue.cancelAll() } label: {
-                    Label("Cancel", systemImage: "stop.fill")
+        if !queue.jobs.isEmpty {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Toggle(isOn: $queue.stripMetadata) {
+                    Label("Strip Metadata", systemImage: queue.stripMetadata ? "location.slash.fill" : "location.slash")
                 }
-                .help("Cancel running conversions (⌘.)")
-            } else {
-                Button { queue.convertAll() } label: {
-                    Label("Convert All", systemImage: "play.fill")
+                .toggleStyle(.button)
+                .labelStyle(.titleAndIcon)
+                .help("Remove EXIF, GPS, IPTC and XMP (images) or container metadata (media)")
+
+                Button { Task { await queue.exportAll() } } label: {
+                    Label("Export All", systemImage: "square.and.arrow.down.on.square")
                 }
-                .disabled(!queue.canConvert)
-                .help("Convert every pending file (⌘↩)")
-            }
+                .labelStyle(.titleAndIcon)
+                .disabled(queue.completedJobs.isEmpty)
+                .help("Save every finished file into a folder (⇧⌘E)")
 
-            Button { Task { await queue.exportAll() } } label: {
-                Label("Export All", systemImage: "square.and.arrow.down.on.square")
-            }
-            .disabled(queue.completedJobs.isEmpty)
-            .help("Save every converted file into a folder (⇧⌘E)")
+                Button { queue.clear() } label: {
+                    Label("Clear", systemImage: "xmark.circle")
+                }
+                .labelStyle(.titleAndIcon)
+                .help("Remove all files from the list")
 
-            Button(role: .destructive) { queue.clear() } label: {
-                Label("Clear", systemImage: "trash")
+                if queue.isRunning {
+                    Button { queue.cancelAll() } label: {
+                        Label("Cancel", systemImage: "stop.fill")
+                    }
+                    .labelStyle(.titleAndIcon)
+                    .help("Cancel running jobs (⌘.)")
+                } else {
+                    Button { queue.convertAll() } label: {
+                        Label(queue.runAllTitle, systemImage: "play.fill")
+                    }
+                    .labelStyle(.titleAndIcon)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!queue.canConvert)
+                    .help("Run every pending file (⌘↩)")
+                }
             }
-            .disabled(queue.jobs.isEmpty)
-            .help("Remove all files from the list")
         }
     }
 }
 
-// MARK: - Drop zone
+// MARK: - Empty state
 
-private struct DropZoneView: View {
+private struct EmptyStateView: View {
     let isTargeted: Bool
     let onChoose: () -> Void
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 16) {
             Image(systemName: "arrow.down.doc")
-                .font(.system(size: 56, weight: .light))
+                .font(.system(size: 44, weight: .light))
                 .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
                 .symbolEffect(.bounce, value: isTargeted)
-            Text("Drop files or folders here")
+            Text("Drop files to convert or compress")
                 .font(.title2.weight(.semibold))
-            Text("Images · PDF · Audio · Video — converted entirely on this Mac.")
-                .foregroundStyle(.secondary)
             Button("Choose Files…", action: onChoose)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .keyboardShortcut("o")
-            VStack(alignment: .leading, spacing: 6) {
-                formatLine("photo", "PNG · TIFF · HEIC · JPEG · BMP · GIF (+ RAW, WebP input)")
-                formatLine("doc.richtext", "Images → PDF, PDF → pages, PDF → embedded images")
-                formatLine("film", "MOV ⇄ MP4 remux, HEVC re-encode")
-                formatLine("waveform", "ALAC · WAV · M4A passthrough")
-            }
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .padding(.top, 8)
+            Text("Images · PDF · Audio · Video")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
-        .padding(40)
+        .frame(maxWidth: 460, maxHeight: 320)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
-            RoundedRectangle(cornerRadius: 18)
-                .strokeBorder(isTargeted ? Color.accentColor : Color.secondary.opacity(0.35),
-                              style: StrokeStyle(lineWidth: 2, dash: [10, 6]))
-                .background(RoundedRectangle(cornerRadius: 18).fill(isTargeted ? Color.accentColor.opacity(0.06) : .clear))
-                .padding(24)
+            RoundedRectangle(cornerRadius: 20)
+                .strokeBorder(isTargeted ? Color.accentColor : Color.secondary.opacity(0.3),
+                              style: StrokeStyle(lineWidth: 1.5, dash: [8, 6]))
+                .background(RoundedRectangle(cornerRadius: 20).fill(isTargeted ? Color.accentColor.opacity(0.06) : .clear))
+                .frame(maxWidth: 560, maxHeight: 360)
         }
-    }
-
-    private func formatLine(_ symbol: String, _ text: String) -> some View {
-        Label(text, systemImage: symbol)
+        .padding(32)
     }
 }
 
-// MARK: - Summary bar
+// MARK: - File list
 
-private struct SummaryBar: View {
+private struct FileListView: View {
+    let queue: ConversionQueueManager
+    let selectedID: ConversionJob.ID?
+    let isDropTargeted: Bool
+    let onSelect: (ConversionJob) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(queue.jobs.count == 1 ? "1 file" : "\(queue.jobs.count) files")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if queue.imageJobs.count >= 2 {
+                        Button("Combine Images into PDF") { queue.combineImagesIntoPDF() }
+                            .buttonStyle(.link)
+                            .help("Add a job that compiles every image into one PDF")
+                    }
+                }
+                .padding(.horizontal, 4)
+
+                LazyVStack(spacing: 8) {
+                    ForEach(queue.jobs) { job in
+                        JobRowView(job: job, isSelected: job.id == selectedID) { queue.remove(job) }
+                            .onTapGesture { onSelect(job) }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+// MARK: - Status bar
+
+private struct StatusBar: View {
     let queue: ConversionQueueManager
 
     var body: some View {
-        HStack(spacing: 16) {
-            Label("100% on-device · network access blocked by App Sandbox", systemImage: "lock.shield.fill")
+        HStack(spacing: 14) {
+            Label("100% on-device · Network blocked by App Sandbox", systemImage: "lock.shield.fill")
                 .foregroundStyle(.green)
-                .help("This app has no network entitlements. The operating system refuses any connection attempt.")
+                .help("LocalConvert has no network entitlements. macOS refuses any connection attempt.")
             Spacer()
             if let activity = queue.activity {
                 ProgressView().controlSize(.small)
                 Text(activity).foregroundStyle(.secondary).lineLimit(1)
-                Divider().frame(height: 14)
             }
-            Text("\(queue.jobs.count) file(s)")
-                .foregroundStyle(.secondary)
             if let totals = queue.totals {
-                Divider().frame(height: 14)
                 Text("\(ByteCount.format(totals.before)) → \(ByteCount.format(totals.after))")
                     .monospacedDigit()
                     .help("\(ByteCount.exact(totals.before)) → \(ByteCount.exact(totals.after))")
-                Text("\(totals.formattedDelta) (\(totals.formattedPercent))")
+                Text(totals.formattedPercent)
                     .monospacedDigit()
                     .fontWeight(.semibold)
                     .foregroundStyle(totals.isSmaller ? .green : (totals.delta == 0 ? .secondary : .orange))
@@ -177,7 +215,7 @@ private struct SummaryBar: View {
             }
         }
         .font(.callout)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(.bar)
     }

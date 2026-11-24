@@ -52,7 +52,27 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         }
     }
 
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat] {
+        guard Self.canRead(sourceType) else { return [] }
+        let preferred: [SupportedFormat]
+        if sourceType.conforms(to: .jpeg) {
+            preferred = [.jpeg, .heic, .png]
+        } else if sourceType.conforms(to: .heic) {
+            preferred = [.heic, .jpeg, .png]
+        } else if sourceType.conforms(to: .png) {
+            preferred = [.heic, .jpeg, .png]
+        } else {
+            preferred = [.heic, .jpeg]
+        }
+        return preferred.filter { format in
+            format.imageIOTypeIdentifier.map(Self.writableTypes.contains) ?? false
+        }
+    }
+
     func convert(_ request: ConversionRequest, progress: @escaping ProgressHandler) async throws -> ConversionOutput {
+        if request.options.mode == .compressSize {
+            return try compress(request, progress: progress)
+        }
         let start = ContinuousClock.now
         guard let destinationType = request.target.imageIOTypeIdentifier,
               let pathExtension = request.target.fileExtension
@@ -74,7 +94,7 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         let fidelity: Fidelity
 
         if sourceTypeID == destinationType, Self.bitstreamCopyTypes.contains(destinationType) {
-            try Self.copyBitstream(source, to: outputURL, type: destinationType, strip: request.options.stripMetadata)
+            try Self.copyBitstream(source, from: request.sourceURL, to: outputURL, type: destinationType, strip: request.options.stripMetadata)
             fidelity = .bitExact
             notes.append(request.options.stripMetadata
                 ? "Metadata removed without decoding or re-compressing image data."
@@ -109,10 +129,16 @@ struct ImageConversionEngine: ConversionEngineProtocol {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
               let type = CGImageSourceGetType(source) as String?
         else { throw ConversionError.unreadableSource(url) }
-        try copyBitstream(source, to: destination, type: type, strip: true)
+        try copyBitstream(source, from: url, to: destination, type: type, strip: true)
     }
 
-    private static func copyBitstream(_ source: CGImageSource, to url: URL, type: String, strip: Bool) throws {
+    private static func copyBitstream(_ source: CGImageSource, from sourceURL: URL, to url: URL, type: String, strip: Bool) throws {
+        // Nothing to change: the honest bit-exact result is the original bytes. (ImageIO's
+        // CopyImageSource also fails with OSStatus 4 when handed no operations.)
+        guard strip else {
+            try FileManager.default.copyItem(at: sourceURL, to: url)
+            return
+        }
         let count = CGImageSourceGetCount(source)
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, type as CFString, count, nil) else {
             throw ConversionError.encoderUnavailable(type)
@@ -242,7 +268,7 @@ struct ImageConversionEngine: ConversionEngineProtocol {
     }
 
     /// Non-identifying properties that affect how the image is displayed.
-    private static func essentialProperties(from frame: [CFString: Any], target: SupportedFormat) -> [CFString: Any] {
+    static func essentialProperties(from frame: [CFString: Any], target: SupportedFormat) -> [CFString: Any] {
         var result: [CFString: Any] = [:]
         for key in [kCGImagePropertyOrientation, kCGImagePropertyDPIWidth, kCGImagePropertyDPIHeight] {
             if let value = frame[key] { result[key] = value }

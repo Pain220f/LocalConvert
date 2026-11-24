@@ -22,8 +22,15 @@ struct PDFConversionEngine: ConversionEngineProtocol {
         return []
     }
 
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat] {
+        if sourceType.conforms(to: .pdf) { return [.pdfCompressed] }
+        if ImageConversionEngine.canRead(sourceType) || sourceType == .image { return [.pdfCompressed] }
+        return []
+    }
+
     func convert(_ request: ConversionRequest, progress: @escaping ProgressHandler) async throws -> ConversionOutput {
         switch request.target {
+        case .pdfCompressed: try compressPDF(request, progress: progress)
         case .pdf: try compilePDF(request, progress: progress)
         case .pdfPages: try splitPages(request, progress: progress)
         case .pdfImages: try extractImages(request, progress: progress)

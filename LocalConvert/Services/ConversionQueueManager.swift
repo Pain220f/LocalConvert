@@ -57,6 +57,7 @@ final class ConversionQueueManager {
         let category: MediaCategory
         let bytes: Int64
         let targets: [SupportedFormat]
+        let compressionTargets: [SupportedFormat]
     }
 
     /// Scans dropped/selected items (expanding folders) off the main actor, then adds jobs.
@@ -71,7 +72,8 @@ final class ConversionQueueManager {
 
         for candidate in candidates where !jobs.contains(where: { $0.sourceURLs == [candidate.url] }) {
             jobs.append(ConversionJob(sourceURLs: [candidate.url], sourceType: candidate.type, category: candidate.category,
-                                      originalBytes: candidate.bytes, availableTargets: candidate.targets))
+                                      originalBytes: candidate.bytes, availableTargets: candidate.targets,
+                                      compressionTargets: candidate.compressionTargets))
         }
         if !rejected.isEmpty {
             let list = rejected.prefix(8).joined(separator: ", ") + (rejected.count > 8 ? " …" : "")
@@ -90,7 +92,8 @@ final class ConversionQueueManager {
             let targets = registry.targets(for: type)
             guard !targets.isEmpty else { rejected.append(url.lastPathComponent); continue }
             let bytes = (try? FileStorageService.byteCount(at: url)) ?? 0
-            accepted.append(Candidate(url: url, type: type, category: category, bytes: bytes, targets: targets))
+            accepted.append(Candidate(url: url, type: type, category: category, bytes: bytes, targets: targets,
+                                      compressionTargets: registry.compressionTargets(for: type)))
         }
         return (accepted, rejected)
     }
@@ -111,7 +114,8 @@ final class ConversionQueueManager {
             sourceType: allJPEG ? .jpeg : .image,
             category: .image,
             originalBytes: images.reduce(0) { $0 + $1.originalBytes },
-            availableTargets: [.pdf]
+            availableTargets: [.pdf],
+            compressionTargets: [.pdfCompressed]
         ))
     }
 
@@ -130,6 +134,18 @@ final class ConversionQueueManager {
     // MARK: - Running
 
     func convertAll() { enqueue(jobs.filter { $0.status.canStart }) }
+
+    /// Title for the primary action, reflecting what the pending jobs will do.
+    var runAllTitle: String {
+        let modes = Set(jobs.filter { $0.status.canStart }.map(\.mode))
+        if modes == [.compressSize] { return "Compress All" }
+        if modes == [.convertFormat] { return "Convert All" }
+        return "Run All"
+    }
+
+    func applySettingsToAll(from job: ConversionJob) {
+        for other in jobs where other !== job { other.adoptSettings(from: job) }
+    }
 
     func convert(_ job: ConversionJob) { enqueue([job]) }
 
@@ -181,15 +197,23 @@ final class ConversionQueueManager {
             sourceURLs: job.sourceURLs,
             sourceType: job.sourceType,
             target: job.target,
-            options: ConversionOptions(stripMetadata: stripMetadata),
+            options: job.options(stripMetadata: stripMetadata),
             outputDirectory: directory
         )
         let scoped = job.sourceURLs.filter { $0.startAccessingSecurityScopedResource() }
         defer { scoped.forEach { $0.stopAccessingSecurityScopedResource() } }
 
         do {
-            let output = try await engine.convert(request) { fraction in
+            var output = try await engine.convert(request) { fraction in
                 Task { @MainActor in job.updateProgress(fraction) }
+            }
+            output.targetMaxBytes = request.options.targetMaxBytes
+            // Safety net: a size limit is a hard promise, whatever the engine did.
+            if let limit = request.options.targetMaxBytes, output.byteCount > limit {
+                try? FileManager.default.removeItem(at: output.url)
+                throw ConversionError.cannotMeetTargetSize(
+                    smallestAchievable: output.byteCount, target: limit,
+                    suggestion: "Try a size-efficient format or allow downscaling.")
             }
             job.finish(with: output)
         } catch is CancellationError {

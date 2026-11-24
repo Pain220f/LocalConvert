@@ -91,6 +91,8 @@ enum SupportedFormat: String, CaseIterable, Identifiable, Sendable {
     case mov, mp4, hevcMOV
     // Audio (AVFoundation)
     case m4a, alac, wav
+    // Size-focused outputs (Compress Size mode)
+    case aac, pdfCompressed
 
     var id: String { rawValue }
 
@@ -111,6 +113,37 @@ enum SupportedFormat: String, CaseIterable, Identifiable, Sendable {
         case .m4a: "M4A (audio passthrough)"
         case .alac: "ALAC (Apple Lossless)"
         case .wav: "WAV (PCM)"
+        case .aac: "AAC (M4A)"
+        case .pdfCompressed: "Compressed PDF"
+        }
+    }
+
+    /// Compact name for pickers and status lines.
+    var shortName: String {
+        switch self {
+        case .png: "PNG"
+        case .tiff: "TIFF"
+        case .heic: "HEIC"
+        case .bmp: "BMP"
+        case .gif: "GIF"
+        case .jpeg: "JPEG"
+        case .pdf, .pdfCompressed: "PDF"
+        case .pdfPages: "PDF pages"
+        case .pdfImages: "PDF images"
+        case .mov: "MOV"
+        case .mp4: "MP4"
+        case .hevcMOV: "HEVC"
+        case .m4a, .aac: "M4A"
+        case .alac: "ALAC"
+        case .wav: "WAV"
+        }
+    }
+
+    /// Whether the codec can trade quality for size (and so can be steered toward a byte limit).
+    var isLossyCapable: Bool {
+        switch self {
+        case .jpeg, .heic, .hevcMOV, .aac, .pdfCompressed: true
+        default: false
         }
     }
 
@@ -127,8 +160,9 @@ enum SupportedFormat: String, CaseIterable, Identifiable, Sendable {
         case .pdfPages, .pdfImages: nil
         case .mov, .hevcMOV: "mov"
         case .mp4: "mp4"
-        case .m4a, .alac: "m4a"
+        case .m4a, .alac, .aac: "m4a"
         case .wav: "wav"
+        case .pdfCompressed: "pdf"
         }
     }
 
@@ -143,11 +177,11 @@ enum SupportedFormat: String, CaseIterable, Identifiable, Sendable {
         case .bmp: .bmp
         case .gif: .gif
         case .jpeg: .jpeg
-        case .pdf: .pdf
+        case .pdf, .pdfCompressed: .pdf
         case .pdfPages, .pdfImages: .folder
         case .mov, .hevcMOV: .quickTimeMovie
         case .mp4: .mpeg4Movie
-        case .m4a, .alac: UTType(filenameExtension: "m4a") ?? .mpeg4Audio
+        case .m4a, .alac, .aac: UTType(filenameExtension: "m4a") ?? .mpeg4Audio
         case .wav: .wav
         }
     }
@@ -188,10 +222,16 @@ enum SupportedFormat: String, CaseIterable, Identifiable, Sendable {
             return .bitExact
         case .mov, .mp4, .m4a:
             return .bitExact
-        case .hevcMOV:
+        case .hevcMOV, .aac, .pdfCompressed:
             return .lossy
         case .alac, .wav:
             return .lossless
         }
+    }
+
+    /// Expected fidelity in a given mode. Compressing to a lossy-capable codec always reduces quality.
+    func fidelity(from sourceType: UTType, mode: ConversionMode) -> Fidelity {
+        guard mode == .compressSize else { return fidelity(from: sourceType) }
+        return isLossyCapable ? .lossy : fidelity(from: sourceType)
     }
 }

@@ -30,7 +30,7 @@ struct ComparisonSheetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
-            if let delta = job.sizeDelta { SizeComparisonView(delta: delta) }
+            if let delta = job.sizeDelta { SizeComparisonView(delta: delta, limit: job.output?.targetMaxBytes) }
             visual
             metadata
             footer
@@ -53,6 +53,13 @@ struct ComparisonSheetView: View {
                     if let output = job.output {
                         FidelityBadge(fidelity: output.fidelity)
                         VerificationLabel(result: output.verification)
+                        if let limit = output.targetMaxBytes {
+                            let met = output.meetsTarget == true
+                            Label(met ? "Limit met: ≤ \(ByteCount.format(limit))" : "Over the \(ByteCount.format(limit)) limit",
+                                  systemImage: met ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(met ? .green : .red)
+                        }
                     }
                 }
             }
@@ -248,38 +255,66 @@ private struct SliderComparisonView: View {
     }
 }
 
-/// Proportional before/after bars with exact byte counts.
+/// Proportional before/after bars with exact byte counts, plus the size limit when there is one.
 struct SizeComparisonView: View {
     let delta: SizeDelta
+    var limit: Int64? = nil
+    /// Narrow layout for the inspector: sizes under the bars instead of beside them.
+    var compact = false
 
     var body: some View {
-        let maximum = Double(max(delta.before, delta.after, 1))
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+        let maximum = Double(max(delta.before, delta.after, limit ?? 0, 1))
+        let afterColor: Color = delta.isSmaller ? .green : (delta.delta == 0 ? .secondary : .orange)
+        VStack(alignment: .leading, spacing: 8) {
             bar(label: "Before", bytes: delta.before, fraction: Double(delta.before) / maximum, color: .secondary)
-            bar(label: "After", bytes: delta.after, fraction: Double(delta.after) / maximum,
-                color: delta.isSmaller ? .green : (delta.delta == 0 ? .secondary : .orange))
-            GridRow {
-                Text("Δ").foregroundStyle(.secondary)
-                Text("\(delta.formattedExactDelta)  (\(delta.formattedPercent))")
-                    .font(.callout.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(delta.isSmaller ? .green : (delta.delta == 0 ? .secondary : .orange))
-                    .gridCellColumns(2)
+            bar(label: "After", bytes: delta.after, fraction: Double(delta.after) / maximum, color: afterColor)
+            if let limit {
+                bar(label: "Limit", bytes: limit, fraction: Double(limit) / maximum, color: .accentColor, dashed: true)
             }
+            Text("\(delta.formattedExactDelta)  (\(delta.formattedPercent))")
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .foregroundStyle(afterColor)
         }
     }
 
-    private func bar(label: String, bytes: Int64, fraction: Double, color: Color) -> some View {
-        GridRow {
-            Text(label).foregroundStyle(.secondary)
-            GeometryReader { geometry in
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(color.opacity(0.7))
-                    .frame(width: max(2, geometry.size.width * fraction))
+    @ViewBuilder
+    private func bar(label: String, bytes: Int64, fraction: Double, color: Color, dashed: Bool = false) -> some View {
+        let track = GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                if dashed {
+                    RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.12))
+                    Rectangle()
+                        .fill(color)
+                        .frame(width: 2)
+                        .offset(x: max(0, geometry.size.width * fraction - 1))
+                } else {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(color.opacity(0.7))
+                        .frame(width: max(2, geometry.size.width * fraction))
+                }
             }
-            .frame(height: 14)
-            Text("\(ByteCount.format(bytes))  ·  \(ByteCount.exact(bytes))")
-                .font(.callout.monospacedDigit())
-                .frame(width: 260, alignment: .trailing)
+        }
+        .frame(height: 12)
+
+        if compact {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(label).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(ByteCount.format(bytes)).monospacedDigit()
+                }
+                .font(.caption)
+                track
+            }
+            .help(ByteCount.exact(bytes))
+        } else {
+            HStack(spacing: 12) {
+                Text(label).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
+                track
+                Text("\(ByteCount.format(bytes))  ·  \(ByteCount.exact(bytes))")
+                    .font(.callout.monospacedDigit())
+                    .frame(width: 260, alignment: .trailing)
+            }
         }
     }
 }

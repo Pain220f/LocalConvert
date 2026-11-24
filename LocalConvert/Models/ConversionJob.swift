@@ -71,7 +71,7 @@ enum JobStatus: Sendable, Equatable {
     }
 }
 
-/// One unit of work in the queue: one or more source files, a chosen target and the result.
+/// One unit of work in the queue: one or more source files, what to do with them, and the result.
 @MainActor
 @Observable
 final class ConversionJob: Identifiable {
@@ -80,9 +80,19 @@ final class ConversionJob: Identifiable {
     let sourceType: UTType
     let category: MediaCategory
     let originalBytes: Int64
-    let availableTargets: [SupportedFormat]
+    /// Targets for Convert Format mode (quality-preserving first).
+    let convertTargets: [SupportedFormat]
+    /// Targets for Compress Size mode (size-efficient first). Empty if the file can't be compressed.
+    let compressionTargets: [SupportedFormat]
 
-    private(set) var target: SupportedFormat
+    private(set) var mode: ConversionMode = .convertFormat
+    private(set) var convertTarget: SupportedFormat
+    private(set) var compressTarget: SupportedFormat?
+    private(set) var isTargetSizeEnabled = false
+    /// Remembered even while the limit is switched off, so toggling doesn't lose the value.
+    private(set) var targetSizeBytes: Int64
+    private(set) var allowResizeToFitTarget = false
+
     var status: JobStatus = .pending
     private(set) var output: ConversionOutput?
 
@@ -92,6 +102,7 @@ final class ConversionJob: Identifiable {
         category: MediaCategory,
         originalBytes: Int64,
         availableTargets: [SupportedFormat],
+        compressionTargets: [SupportedFormat] = [],
         target: SupportedFormat? = nil
     ) {
         precondition(!sourceURLs.isEmpty && !availableTargets.isEmpty)
@@ -99,18 +110,44 @@ final class ConversionJob: Identifiable {
         self.sourceType = sourceType
         self.category = category
         self.originalBytes = originalBytes
-        self.availableTargets = availableTargets
-        self.target = target ?? availableTargets[0]
+        self.convertTargets = availableTargets
+        self.compressionTargets = compressionTargets
+        self.convertTarget = target ?? availableTargets[0]
+        self.compressTarget = compressionTargets.first
+        self.targetSizeBytes = Self.suggestedLimit(for: originalBytes)
     }
+
+    /// Half the original, rounded down to a tidy value (at least 10 KB).
+    static func suggestedLimit(for bytes: Int64) -> Int64 {
+        let half = max(bytes / 2, 10_000)
+        let step: Int64 = half >= 10_000_000 ? 1_000_000 : (half >= 1_000_000 ? 100_000 : 10_000)
+        return max(step, (half / step) * step)
+    }
+
+    // MARK: Derived
 
     var primaryURL: URL { sourceURLs[0] }
     var isCombined: Bool { sourceURLs.count > 1 }
+    var supportsCompression: Bool { !compressionTargets.isEmpty }
 
     var displayName: String {
         isCombined ? "Combined PDF (\(sourceURLs.count) images)" : primaryURL.lastPathComponent
     }
 
-    var plannedFidelity: Fidelity { target.fidelity(from: sourceType) }
+    var target: SupportedFormat {
+        mode == .compressSize ? (compressTarget ?? convertTarget) : convertTarget
+    }
+
+    var availableTargets: [SupportedFormat] {
+        mode == .compressSize ? compressionTargets : convertTargets
+    }
+
+    /// The strict byte limit that will be enforced, if any.
+    var targetMaxBytes: Int64? {
+        mode == .compressSize && isTargetSizeEnabled ? targetSizeBytes : nil
+    }
+
+    var plannedFidelity: Fidelity { target.fidelity(from: sourceType, mode: mode) }
 
     var sizeDelta: SizeDelta? {
         output.map { SizeDelta(before: originalBytes, after: $0.byteCount) }
@@ -118,9 +155,59 @@ final class ConversionJob: Identifiable {
 
     var isBusy: Bool { status.isBusy }
 
+    func options(stripMetadata: Bool) -> ConversionOptions {
+        ConversionOptions(stripMetadata: stripMetadata, mode: mode,
+                          targetMaxBytes: targetMaxBytes, allowResizeToFitTarget: allowResizeToFitTarget)
+    }
+
+    // MARK: Editing (every change invalidates the previous result)
+
+    func setMode(_ newMode: ConversionMode) {
+        guard newMode != mode, !isBusy, newMode == .convertFormat || supportsCompression else { return }
+        mode = newMode
+        reset()
+    }
+
     func setTarget(_ newTarget: SupportedFormat) {
         guard newTarget != target, availableTargets.contains(newTarget), !isBusy else { return }
-        target = newTarget
+        if mode == .compressSize { compressTarget = newTarget } else { convertTarget = newTarget }
+        reset()
+    }
+
+    /// `nil` switches the limit off. Values are clamped to at least 1 KB.
+    func setTargetMaxBytes(_ bytes: Int64?) {
+        guard !isBusy else { return }
+        if let bytes {
+            let clamped = max(bytes, 1_000)
+            guard !isTargetSizeEnabled || clamped != targetSizeBytes else { return }
+            targetSizeBytes = clamped
+            isTargetSizeEnabled = true
+        } else {
+            guard isTargetSizeEnabled else { return }
+            isTargetSizeEnabled = false
+        }
+        reset()
+    }
+
+    func setAllowResizeToFitTarget(_ allow: Bool) {
+        guard allow != allowResizeToFitTarget, !isBusy else { return }
+        allowResizeToFitTarget = allow
+        reset()
+    }
+
+    /// Copies mode and size settings from another job where they apply to this file.
+    func adoptSettings(from other: ConversionJob) {
+        guard !isBusy, other !== self else { return }
+        if other.mode == .compressSize, supportsCompression {
+            mode = .compressSize
+            if compressionTargets.contains(other.target) { compressTarget = other.target }
+            isTargetSizeEnabled = other.isTargetSizeEnabled
+            targetSizeBytes = other.targetSizeBytes
+            allowResizeToFitTarget = other.allowResizeToFitTarget
+        } else {
+            mode = .convertFormat
+            if convertTargets.contains(other.target) { convertTarget = other.target }
+        }
         reset()
     }
 

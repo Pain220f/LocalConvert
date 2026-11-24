@@ -1,9 +1,38 @@
 import Foundation
 import UniformTypeIdentifiers
 
+/// What the user is trying to achieve for a file.
+enum ConversionMode: String, Sendable, CaseIterable, Identifiable {
+    /// Change format or container, preserving quality (bit-exact / lossless by default).
+    case convertFormat
+    /// Make the file smaller, optionally strictly below a byte limit.
+    case compressSize
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .convertFormat: "Convert Format"
+        case .compressSize: "Compress Size"
+        }
+    }
+
+    var verb: String {
+        switch self {
+        case .convertFormat: "Convert"
+        case .compressSize: "Compress"
+        }
+    }
+}
+
 struct ConversionOptions: Sendable, Equatable {
     /// Remove EXIF / GPS / IPTC / XMP (images) or container metadata (media).
     var stripMetadata = false
+    var mode: ConversionMode = .convertFormat
+    /// Strict upper bound for the output size in bytes (`nil` = no limit). Only used in `.compressSize`.
+    var targetMaxBytes: Int64?
+    /// Allow reducing pixel dimensions (images) or rasterizing pages (PDF) when quality alone can't fit the limit.
+    var allowResizeToFitTarget = false
 }
 
 struct ConversionRequest: Sendable {
@@ -60,6 +89,10 @@ struct ConversionOutput: Sendable {
     let notes: [String]
     let engineName: String
     let elapsed: Duration
+    /// The byte limit the output was produced for, if any (set by the queue manager).
+    var targetMaxBytes: Int64?
+
+    var meetsTarget: Bool? { targetMaxBytes.map { byteCount <= $0 } }
 }
 
 enum ConversionError: LocalizedError {
@@ -73,6 +106,8 @@ enum ConversionError: LocalizedError {
     case encryptedPDF
     case nothingToExtract
     case engineFailure(String)
+    /// The byte limit can't be met with the current settings. Nothing is written.
+    case cannotMeetTargetSize(smallestAchievable: Int64, target: Int64, suggestion: String)
 
     var errorDescription: String? {
         switch self {
@@ -96,6 +131,8 @@ enum ConversionError: LocalizedError {
             "No extractable raster images were found in this PDF."
         case let .engineFailure(reason):
             reason
+        case let .cannotMeetTargetSize(smallest, target, suggestion):
+            "Can't fit under \(ByteCount.format(target)): the smallest result is \(ByteCount.format(smallest)). \(suggestion)"
         }
     }
 }
@@ -114,6 +151,13 @@ protocol ConversionEngineProtocol: Sendable {
     func supportedTargets(for sourceType: UTType) -> [SupportedFormat]
 
     func convert(_ request: ConversionRequest, progress: @escaping ProgressHandler) async throws -> ConversionOutput
+
+    /// Size-reducing outputs for `sourceType`, best first (Compress Size mode). Defaults to none.
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat]
+}
+
+extension ConversionEngineProtocol {
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat] { [] }
 }
 
 /// Ordered collection of engines. The first engine that supports a (source, target) pair wins.
@@ -136,8 +180,20 @@ struct EngineRegistry: Sendable {
         return result
     }
 
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat] {
+        var result: [SupportedFormat] = []
+        for engine in engines {
+            for target in engine.compressionTargets(for: sourceType) where !result.contains(target) {
+                result.append(target)
+            }
+        }
+        return result
+    }
+
     func engine(for target: SupportedFormat, sourceType: UTType) -> (any ConversionEngineProtocol)? {
-        engines.first { $0.supportedTargets(for: sourceType).contains(target) }
+        engines.first {
+            $0.supportedTargets(for: sourceType).contains(target) || $0.compressionTargets(for: sourceType).contains(target)
+        }
     }
 }
 

@@ -46,6 +46,18 @@ struct FidelityRegressionTests {
         }
     }
 
+    @Test("JPEG → JPEG without stripping is a byte-for-byte copy (default convert target)")
+    func jpegDefaultConvertIsCopy() async throws {
+        let directory = try Fixtures.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let jpeg = try Fixtures.write(Fixtures.gradientImage(), as: .jpeg, to: directory.appending(path: "holiday.jpg"),
+                                      properties: Self.gpsProperties)
+        let output = try await ImageConversionEngine().convert(Fixtures.request(jpeg, .jpeg, .jpeg, output: directory)) { _ in }
+        #expect(output.fidelity == .bitExact)
+        #expect(try Data(contentsOf: output.url) == Data(contentsOf: jpeg))
+        #expect(output.verification == .pixelIdentical)
+    }
+
     // MARK: PDF metadata
 
     @Test("Images → PDF embeds JPEG GPS data unless stripping, which keeps the DCT data intact")

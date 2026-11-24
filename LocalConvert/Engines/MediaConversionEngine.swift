@@ -30,6 +30,12 @@ struct MediaConversionEngine: ConversionEngineProtocol {
         return []
     }
 
+    func compressionTargets(for sourceType: UTType) -> [SupportedFormat] {
+        if sourceType.conforms(to: .movie) { return [.hevcMOV, .aac] }
+        if sourceType.conforms(to: .audio) { return [.aac, .alac] }
+        return []
+    }
+
     func convert(_ request: ConversionRequest, progress: @escaping ProgressHandler) async throws -> ConversionOutput {
         let start = ContinuousClock.now
         guard let pathExtension = request.target.fileExtension else {
@@ -58,6 +64,14 @@ struct MediaConversionEngine: ConversionEngineProtocol {
                                  metadata: strip ? [] : try await asset.load(.metadata), progress: progress)
                 fidelity = .bitExact
                 notes.append("Audio bitstream copied into an M4A container without re-encoding.")
+            case .hevcMOV where request.options.mode == .compressSize && request.options.targetMaxBytes != nil:
+                notes += try await compressVideo(asset, source: request.sourceURL, to: outputURL,
+                                                 limit: request.options.targetMaxBytes!, strip: strip, progress: progress)
+                fidelity = .lossy
+            case .aac:
+                notes += try await encodeAAC(asset, source: request.sourceURL, to: outputURL,
+                                             limit: request.options.targetMaxBytes, strip: strip, progress: progress)
+                fidelity = .lossy
             case .hevcMOV:
                 try await export(asset, preset: AVAssetExportPresetHEVCHighestQuality, fileType: .mov,
                                  to: outputURL, strip: strip, progress: progress)
@@ -75,13 +89,25 @@ struct MediaConversionEngine: ConversionEngineProtocol {
             throw error
         }
         if strip { notes.append("Container metadata (incl. location) removed.") }
+        if let limit = request.options.targetMaxBytes {
+            let size = try FileStorageService.byteCount(at: outputURL)
+            guard size <= limit else {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw ConversionError.cannotMeetTargetSize(
+                    smallestAchievable: size, target: limit,
+                    suggestion: request.target.isLossyCapable
+                        ? "Raise the limit."
+                        : "\(request.target.shortName) is lossless. Choose AAC (M4A) to compress further.")
+            }
+            notes.append("\(ByteCount.exact(size)) — within the \(ByteCount.exact(limit)) limit.")
+        }
         progress(1)
         return try OutputBuilder.make(url: outputURL, fidelity: fidelity, notes: notes, engineName: displayName, startedAt: start)
     }
 
     // MARK: - Export session (remux / HEVC)
 
-    private func export(
+    func export(
         _ asset: AVAsset,
         preset: String,
         fileType: AVFileType,
@@ -277,7 +303,7 @@ struct MediaConversionEngine: ConversionEngineProtocol {
 
     /// Re-expresses the source's tags (iTunes, QuickTime, ID3, …) through their common keys so the
     /// writer can map them into the output container.
-    private static func portableMetadata(from asset: AVAsset) async throws -> [AVMetadataItem] {
+    static func portableMetadata(from asset: AVAsset) async throws -> [AVMetadataItem] {
         var result: [AVMetadataItem] = []
         var seen = Set<String>()
         for item in try await asset.load(.metadata) {

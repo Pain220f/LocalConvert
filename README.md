@@ -8,6 +8,26 @@ A native macOS file converter that runs **100% on-device**: it never sends anyth
 
 Requires macOS 15.6 or later and builds with Xcode 26 or later in Swift 6 language mode (strict concurrency). It runs natively on Apple Silicon and Intel, and has **no third-party dependencies**.
 
+## Two modes
+
+Pick a file to see its controls in the inspector on the right.
+
+- **Convert Format** changes the format or container while preserving quality. Defaults are always bit-exact or lossless.
+- **Compress Size** makes the file smaller. You can keep the current format when it's compressible, or pick a size-efficient one: HEIC/JPEG for images, HEVC for video, AAC (M4A) for audio, or a compressed PDF. Turn on **Keep under** to set a strict maximum size, by typing it or with the one-click presets (50%, 25%, 100 KB, 250 KB, …). Presets larger than the original are hidden.
+
+### How the size limit is guaranteed
+
+| Output | Strategy | If it can't fit |
+|---|---|---|
+| JPEG / HEIC | In-memory binary search over quality, keeping the **highest** quality whose encoding fits. The exact winning bytes are written. | With *Allow downscaling*: binary search over scale, then quality. Without it: fails, reporting the smallest achievable size. |
+| PNG | Encoded losslessly. It is never made lossy just to fit. | Downscales only if allowed. Otherwise it fails and suggests HEIC or JPEG. |
+| HEVC video | Bitrate derived from `limit × 8 × 0.92 / duration − audio`. The result is measured, and one tightened second pass runs if needed. | Fails with an estimate of the smallest achievable size. |
+| AAC audio | Bitrate derived from `limit × 8 × 0.94 / duration`, measured, and retried at a lower bitrate. | Fails at the encoder's minimum bitrate. |
+| ALAC / WAV | Lossless. The size is checked afterwards. | Fails and suggests AAC. |
+| PDF | PDFKit re-saves with JPEG image compression and keeps text and vectors. | With *Allow downscaling*: pages are rasterized to size-searched JPEG (text stops being selectable). Otherwise it fails. |
+
+On top of these, the queue manager re-checks every result: an output larger than the limit is deleted and reported as a failure, so a limit is never exceeded silently.
+
 ---
 
 ## Privacy guarantees
@@ -74,6 +94,9 @@ LocalConvert/
 │   │   ├── ImageConversionEngine.swift     # ImageIO: bitstream copy, lossless re-encode, metadata strip
 │   │   ├── PDFConversionEngine.swift       # Quartz/PDFKit: compile, split, raw XObject extraction
 │   │   ├── MediaConversionEngine.swift     # AVFoundation remux, PCM→ALAC/WAV, VideoToolbox HEVC
+│   │   ├── ImageCompression.swift          # Target-size quality/scale search for JPEG, HEIC, PNG
+│   │   ├── MediaCompression.swift          # Bitrate-targeted HEVC + AAC, interleaved reader/writer pump
+│   │   ├── PDFCompression.swift            # PDFKit JPEG re-save, optional size-searched rasterization
 │   │   └── BundledToolEngine.swift         # Future hook: signed CLI in Contents/MacOS (not registered)
 │   ├── Services/
 │   │   ├── ConversionQueueManager.swift # Bounded-concurrency TaskGroup, cancellation, export
@@ -82,15 +105,17 @@ LocalConvert/
 │   │   ├── MetadataInspector.swift      # Flattened metadata diff + previews (Quick Look, CoreImage)
 │   │   └── PanelService.swift           # NSOpenPanel / NSSavePanel
 │   ├── Views/
-│   │   ├── ContentView.swift            # Toolbar, drag-and-drop zone, job list, totals bar
-│   │   ├── JobRowView.swift             # Target picker, fidelity badge, status, before/after delta
+│   │   ├── ContentView.swift            # Lean toolbar, empty state, card list + inspector, status bar
+│   │   ├── JobRowView.swift             # File card: icon, name, type, size, result or inline error
+│   │   ├── JobInspectorView.swift       # Mode switch, format picker, Keep-under limit, presets, result
 │   │   └── ComparisonSheetView.swift    # Side-by-side / slider / difference views + metadata diff table
 │   └── Resources/Assets.xcassets
-├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app (37 tests)
+├── LocalConvertTests/                   # Swift Testing, hosted in the sandboxed app (52 tests)
 │   ├── ImageConversionTests.swift       # Lossless round trips, GPS stripping, PDF passthrough, byte counts
 │   ├── FidelityRegressionTests.swift    # PDF metadata stripping, orientation, animated frames, safe defaults
 │   ├── MediaConversionTests.swift       # WAV → ALAC → WAV sample-exact round trip
 │   ├── VideoConversionTests.swift       # Synthetic H.264+AAC movies: remux, M4A, HEVC, metadata keep/strip
+│   ├── CompressionTests.swift           # Strict size limits, monotonic quality, refusals, downscaling, job modes
 │   ├── QueueAndStorageTests.swift       # Bounded concurrency, cancellation, folder import, combine, atomic export
 │   └── SandboxEntitlementTests.swift    # SecTask entitlement checks + kernel socket denial
 └── Scripts/verify-privacy.sh            # Static audit of the signed Release binary
